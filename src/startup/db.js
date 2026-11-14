@@ -54,7 +54,28 @@ module.exports = async function(){
         ['client',           'pinfl',              'VARCHAR(14) NULL DEFAULT NULL'],
         // Dollardagi tovar: kelish narxi ($). Sotuv narxi $ — retail_price_usd
         ['product',          'cost_price_usd',     'DECIMAL(15,4) NOT NULL DEFAULT 0'],
+        // Yetkazuvchi: hisob valyutasi va dollardagi balans
+        ['supplier',         'currency',           "VARCHAR(10) NOT NULL DEFAULT 'UZS'"],
+        ['supplier',         'balance_usd',        'DECIMAL(18,4) NOT NULL DEFAULT 0'],
     ];
+
+    // Yetkazuvchi bilan qo'lda kiritiladigan qarz va kassadan tashqari to'lov
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS \`supplier_entry\` (
+        \`id\`            INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        \`supplier_id\`   INT NOT NULL,
+        \`date\`          DATETIME NOT NULL,
+        \`type\`          ENUM('qarz','tolov') NOT NULL,
+        \`amount\`        DECIMAL(18,2) NOT NULL DEFAULT 0,
+        \`amount_usd\`    DECIMAL(15,4) NOT NULL DEFAULT 0,
+        \`exchange_rate\` DECIMAL(12,2) NOT NULL DEFAULT 0,
+        \`comment\`       TEXT NULL,
+        \`created_by\`    INT NULL,
+        \`created_at\`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\`    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX \`idx_se_supplier\` (\`supplier_id\`, \`date\`)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
 
     // Nasiya grafigi — har oy uchun bitta satr
     await db.query(`

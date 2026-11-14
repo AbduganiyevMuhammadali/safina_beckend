@@ -11,6 +11,9 @@ SupplierModel.init({
   address: { type: DataTypes.TEXT,        allowNull: true },
   // negative = biz ularga qarzimiz, positive = ular bizga qarz
   balance: { type: DataTypes.DECIMAL(18, 2), defaultValue: 0 },
+  // Hisob valyutasi: 'USD' — qarz dollarda yuritiladi (yuk xatlari dollarda)
+  currency:    { type: DataTypes.STRING(10), defaultValue: 'UZS' },
+  balance_usd: { type: DataTypes.DECIMAL(18, 4), defaultValue: 0 },
   comment: { type: DataTypes.TEXT,        allowNull: true },
   active:  { type: DataTypes.BOOLEAN,     defaultValue: true },
 }, {

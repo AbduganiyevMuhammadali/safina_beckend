@@ -14,6 +14,10 @@ CashTransactionModel.init({
   client_id:      { type: DataTypes.INTEGER, allowNull: true },
   description:    { type: DataTypes.TEXT, allowNull: true },
   cashier_id:     { type: DataTypes.INTEGER, allowNull: true },
+  // Ustunlar bazada bor edi, lekin modelda yo'qligi uchun hech qachon
+  // yozilmasdi (dollar summasi doim 0 chiqardi)
+  exchange_rate:  { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
+  amount_usd:     { type: DataTypes.DECIMAL(15, 4), defaultValue: 0 },
 }, {
   sequelize,
   modelName: 'CashTransactionModel',
