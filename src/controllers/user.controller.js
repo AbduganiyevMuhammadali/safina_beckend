@@ -10,6 +10,13 @@ const moment = require('moment');
 /******************************************************************************
  *                              User Controller
  ******************************************************************************/
+// Parolni terib topishdan himoya: bir manzil + login bo'yicha ketma-ket
+// 5 ta xato urinishdan keyin 5 daqiqa kutiladi. Kirish oynasida faqat
+// qisqa parol so'ralgani uchun bu shart (sayt internetda ochiq).
+const URINISH_MAX = 5
+const BLOK_MS = 5 * 60 * 1000
+const urinishlar = new Map()   // kalit -> { n, gacha }
+
 class UserController extends BaseController {
     getAll = async (req, res, next) => {
         let modelList = await UserModel.findAll({
@@ -141,21 +148,32 @@ class UserController extends BaseController {
 
         const { username, password: pass } = req.body;
 
+        const kalit = `${req.ip}|${String(username || '').toLowerCase()}`;
+        const holat = urinishlar.get(kalit);
+        if (holat?.gacha > Date.now()) {
+            const daq = Math.ceil((holat.gacha - Date.now()) / 60000);
+            throw new HttpException(429, `Parol ko'p marta noto'g'ri kiritildi. ${daq} daqiqadan keyin qayta urinib ko'ring`);
+        }
+        const xato = () => {
+            const n = (holat?.n || 0) + 1;
+            urinishlar.set(kalit, n >= URINISH_MAX ? { n: 0, gacha: Date.now() + BLOK_MS } : { n, gacha: 0 });
+            // Xotira o'smasin — eski yozuvlarni vaqti-vaqti bilan tozalaymiz
+            if (urinishlar.size > 5000) for (const [k, v] of urinishlar) if (!(v.gacha > Date.now())) urinishlar.delete(k);
+            throw new HttpException(401, req.mf('Incorrect login or password!'));
+        };
+
         const user = await UserModel.findOne({
             where: {
                 username
             }
         });
 
-        if (!user) {
-            throw new HttpException(401, req.mf('Incorrect login or password!'));
-        }
+        if (!user) xato();
 
         const isMatch = await bcrypt.compare(pass, user.password);
 
-        if (!isMatch) {
-            throw new HttpException(401, req.mf('Incorrect login or password!'));
-        }
+        if (!isMatch) xato();
+        urinishlar.delete(kalit);
 
         // user matched!
         const token = jwt.sign({ user_id: user.id.toString() }, secret_jwt, {
