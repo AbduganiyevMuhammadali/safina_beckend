@@ -39,6 +39,9 @@ ProductModel.init({
   retail_price:        { type: DataTypes.DECIMAL(15, 2), allowNull: false, defaultValue: 0 },
   retail_price_usd:    { type: DataTypes.DECIMAL(15, 4), allowNull: true,  defaultValue: 0 },
   currency:            { type: DataTypes.STRING(10),     allowNull: true,  defaultValue: "So'm" },
+  // Dollardagi tovar (currency = 'USD'): kelish narxi $. So'mdagi narx
+  // retail_price_usd × kurs dan hisoblanadi (utils/valyuta.utils.js)
+  cost_price_usd:      { type: DataTypes.DECIMAL(15, 4), allowNull: false, defaultValue: 0 },
   qty:     { type: DataTypes.DECIMAL(15, 3), allowNull: false, defaultValue: 0 },
   min_qty: { type: DataTypes.DECIMAL(15, 3), allowNull: true,  defaultValue: 0 },
   is_folder: { type: DataTypes.BOOLEAN, allowNull: false, defaultValue: false },

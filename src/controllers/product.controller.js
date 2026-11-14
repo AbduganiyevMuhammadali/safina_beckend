@@ -4,12 +4,14 @@ const { Op } = require('sequelize');
 const sequelize = require('../db/db-sequelize');
 const BaseController = require('./BaseController');
 const { barcodeVariants } = require('../utils/barcode.utils');
+const { usdNarxQoy } = require('../utils/valyuta.utils');
+const { kursOqi } = require('./valyuta.controller');
 
 const ALLOWED_FIELDS = [
   'code', 'name', 'general_name', 'unit', 'brand', 'model', 'country',
   'category', 'color', 'extra_name1', 'extra_name2', 'extra_name3',
   'barcodes', 'photo', 'wholesale_price', 'wholesale_price_usd',
-  'retail_price', 'retail_price_usd', 'currency', 'qty', 'min_qty',
+  'retail_price', 'retail_price_usd', 'currency', 'cost_price_usd', 'qty', 'min_qty',
   'is_folder', 'active',
 ];
 
@@ -71,6 +73,9 @@ class ProductController extends BaseController {
         { general_name: { [Op.like]: `${q}%` } },
         { code:         { [Op.like]: `${q}%` } },
         { brand:        { [Op.like]: `${q}%` } },
+        // Muqobil nom — yetkazib beruvchi yuk xatidagi nom va kod
+        // (masalan "7146 · IMMER BLACK-T7 7 кг"), so'z o'rtasidan ham
+        { extra_name1:  { [Op.like]: `%${q}%` } },
         // Shtrix-kod: skaner boshidagi nolni tushirib yuborgan bo'lishi
         // mumkin, shuning uchun barcha shakllar bo'yicha qidiramiz
         ...barcodeVariants(q).map(v => ({ barcodes: { [Op.like]: `%"${v}%` } })),
@@ -160,6 +165,8 @@ class ProductController extends BaseController {
     if (!data.name) throw new HttpException(400, 'Mahsulot nomi kiritilishi shart');
 
     if (!data.code) data.code = await nextProductCode();
+    // Dollardagi tovar: so'mdagi narx kursdan hisoblanadi
+    if (data.currency === 'USD') usdNarxQoy(data, await kursOqi());
 
     const product = await ProductModel.create(data);
     res.status(201).json(product);
@@ -176,6 +183,14 @@ class ProductController extends BaseController {
   // berishi mumkin — bunda har razmer alohida mahsulot bo'lib yaratiladi.
   bulkCreate = async (req, res) => {
     const { items = [], supplier_id = null, doc_date = null } = req.body;
+    // Hujjat izohi (masalan "Avangard yuk xati №2399") — tarix filtri
+    // "Boshlang'ich qoldiq" bo'yicha ishlagani uchun shu so'z saqlanadi
+    const izoh = String(req.body.comment || '').trim().slice(0, 200);
+    const cfg = await kursOqi();
+    // Kelish narxi so'mda: dollardagi tovarda kelish $ × kurs
+    const tannarx = d => (d.currency === 'USD' && Number(d.cost_price_usd) > 0)
+      ? Math.round(Number(d.cost_price_usd) * cfg.kurs * 100) / 100
+      : Number(d.cost_price) || 0;
     if (!Array.isArray(items) || !items.length) {
       throw new HttpException(400, 'Mahsulotlar ro\'yxati bo\'sh');
     }
@@ -287,6 +302,7 @@ class ProductController extends BaseController {
         const data = this._pick(e.data);
         data.name = (data.name || data.general_name || '').toString().trim();
         if (!data.general_name) data.general_name = data.name;
+        if (data.currency === 'USD') usdNarxQoy(data, cfg);
 
         // Shu nomli tovar allaqachon bormi
         const bor = nomXarita.get(data.name.toLowerCase());
@@ -294,8 +310,19 @@ class ProductController extends BaseController {
           mavjudgaQoshildi.push({
             product: bor,
             qty:  e.qty,
-            cost: Number(e.data.cost_price) || 0,
+            cost: tannarx(e.data),
             barcodes: e.barcodes,
+            // Dollardagi tovar qayta kelsa — oxirgi kelish va sotuv narxi
+            narx: data.currency === 'USD' && Number(data.retail_price_usd) > 0
+              ? {
+                  currency: 'USD',
+                  cost_price_usd: Number(data.cost_price_usd) || 0,
+                  retail_price_usd: Number(data.retail_price_usd),
+                  retail_price: data.retail_price,
+                  ...(Number(data.wholesale_price_usd) > 0
+                    ? { wholesale_price_usd: Number(data.wholesale_price_usd), wholesale_price: data.wholesale_price } : {}),
+                }
+              : null,
           });
           continue;
         }
@@ -313,7 +340,7 @@ class ProductController extends BaseController {
         if (e.barcodes) data.barcodes = e.barcodes;
         data.qty = 0;   // qoldiq kirim hujjati orqali qo'shiladi
 
-        toCreate.push({ data, qty: e.qty, cost: Number(e.data.cost_price) || 0 });
+        toCreate.push({ data, qty: e.qty, cost: tannarx(e.data) });
         // Shu partiya ichida ikkinchi marta kelsa ham takrorlanmasin —
         // lekin id hali yo'q, shuning uchun keyin to'ldiramiz
         nomXarita.set(data.name.toLowerCase(), null);
@@ -345,6 +372,7 @@ class ProductController extends BaseController {
       // Shtrix-kod ham qo'shiladi: har kelishda yangi yorliq bosilsa,
       // eskisi ham ishlashda davom etsin.
       for (const m of mavjudgaQoshildi) {
+        if (m.narx) await m.product.update(m.narx, { transaction: t });
         if (m.barcodes && m.barcodes.length) {
           const eski = Array.isArray(m.product.barcodes) ? m.product.barcodes : [];
           const yangi = [...new Set([...eski, ...m.barcodes.map(b => String(b).trim())])]
@@ -368,9 +396,11 @@ class ProductController extends BaseController {
           doc_number: (Number(maxDoc) || 0) + 1,
           date: doc_date || new Date(),
           supplier_id,
-          comment: 'Boshlang\'ich qoldiq',
+          comment: izoh ? `Boshlang'ich qoldiq · ${izoh}` : 'Boshlang\'ich qoldiq',
           status: 'confirmed',
           total_sum: total,
+          exchange_rate: cfg.kurs,
+          total_usd: cfg.kurs > 0 ? +(total / cfg.kurs).toFixed(4) : 0,
           created_by: req.currentUser?.id ?? null,
         }, { transaction: t });
         purchaseId = purchase.id;
@@ -445,6 +475,7 @@ class ProductController extends BaseController {
     if (!product) throw new HttpException(404, req.mf('data not found'));
 
     const data = this._pick(req.body);
+    await this._usdNarx(data, product);
     await product.update(data);
     res.json(product);
   };
@@ -454,6 +485,7 @@ class ProductController extends BaseController {
     const product = await ProductModel.findOne({ where: { id: req.params.id } });
     if (!product) throw new HttpException(404, req.mf('data not found'));
     const data = this._pick(req.body);
+    await this._usdNarx(data, product);
     await product.update(data);
     res.json(product);
   };
@@ -605,6 +637,23 @@ class ProductController extends BaseController {
     });
     res.json({ count });
   };
+
+  // Tahrirda narx yoki valyuta o'zgarsa — dollardagi tovarning so'm narxi
+  // kursdan qayta hisoblanadi (kassir so'mni qo'lda o'zgartira olmaydi)
+  async _usdNarx(data, product) {
+    const narxMaydoni = ['currency', 'retail_price_usd', 'wholesale_price_usd', 'retail_price', 'wholesale_price']
+    if (!narxMaydoni.some(f => data[f] !== undefined)) return;
+    const cur = data.currency ?? product.currency;
+    if (cur !== 'USD') return;
+    const tmp = {
+      currency: 'USD',
+      retail_price_usd:    data.retail_price_usd    ?? product.retail_price_usd,
+      wholesale_price_usd: data.wholesale_price_usd ?? product.wholesale_price_usd,
+    };
+    usdNarxQoy(tmp, await kursOqi());
+    if (tmp.retail_price !== undefined)    data.retail_price    = tmp.retail_price;
+    if (tmp.wholesale_price !== undefined) data.wholesale_price = tmp.wholesale_price;
+  }
 
   _pick(body) {
     const out = {};

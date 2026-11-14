@@ -19,6 +19,7 @@ const debtorRouter       = require('../routes/debtor.route');
 const botRouter          = require('../routes/bot.route');
 const snapshotRouter     = require('../routes/snapshot.route');
 const nasiyaRouter       = require('../routes/nasiya.route');
+const valyutaRouter      = require('../routes/valyuta.route');
 const HttpException = require('../utils/HttpException.utils');
 
 module.exports = async function(app){
@@ -49,6 +50,7 @@ module.exports = async function(app){
         app.use('/api/v1/bot',           botRouter);
         app.use('/api/v1/snapshots',     snapshotRouter);
         app.use('/api/v1/nasiya',        nasiyaRouter);
+        app.use('/api/v1/valyuta',       valyutaRouter);
             
         // 404 error
         app.all('*', (req, res, next) => {

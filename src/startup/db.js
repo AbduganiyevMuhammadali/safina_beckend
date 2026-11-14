@@ -52,6 +52,8 @@ module.exports = async function(){
         // Mijoz pasporti va JSHSHIR — nasiya shartnomasi va kredit tarixi
         ['client',           'passport',           'VARCHAR(20) NULL DEFAULT NULL'],
         ['client',           'pinfl',              'VARCHAR(14) NULL DEFAULT NULL'],
+        // Dollardagi tovar: kelish narxi ($). Sotuv narxi $ — retail_price_usd
+        ['product',          'cost_price_usd',     'DECIMAL(15,4) NOT NULL DEFAULT 0'],
     ];
 
     // Nasiya grafigi — har oy uchun bitta satr
