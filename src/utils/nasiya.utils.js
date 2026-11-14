@@ -40,6 +40,8 @@ const DEFAULT_CONFIG = {
   script: 'kirill',
   // Nasiyada xaridor pasporti majburiy (shartnoma va kredit tarixi uchun)
   passportRequired: true,
+  // Narx kartochkasi uslubi: 'zamonaviy' (yangi) yoki 'klassik' (Excel kabi)
+  cardStyle: 'zamonaviy',
 }
 
 function matn(v, def, max) {
@@ -85,6 +87,7 @@ function normalizeConfig(raw) {
       ? r.cardSubtitle.trim().slice(0, 80) : DEFAULT_CONFIG.cardSubtitle,
     script:       r.script === 'lotin' ? 'lotin' : 'kirill',
     passportRequired: r.passportRequired === undefined ? true : !!r.passportRequired,
+    cardStyle: r.cardStyle === 'klassik' ? 'klassik' : 'zamonaviy',
   }
 }
 
