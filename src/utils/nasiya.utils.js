@@ -38,6 +38,8 @@ const DEFAULT_CONFIG = {
   cardSubtitle: 'Universal Market Nasiya Savdo',
   // Kartochka/shartnoma yozuvi: 'kirill' (do'kondagi Excel kabi) yoki 'lotin'
   script: 'kirill',
+  // Nasiyada xaridor pasporti majburiy (shartnoma va kredit tarixi uchun)
+  passportRequired: true,
 }
 
 function matn(v, def, max) {
@@ -82,6 +84,7 @@ function normalizeConfig(raw) {
     cardSubtitle: typeof r.cardSubtitle === 'string'
       ? r.cardSubtitle.trim().slice(0, 80) : DEFAULT_CONFIG.cardSubtitle,
     script:       r.script === 'lotin' ? 'lotin' : 'kirill',
+    passportRequired: r.passportRequired === undefined ? true : !!r.passportRequired,
   }
 }
 

@@ -231,6 +231,11 @@ class SaleController {
       if (!header.client_id) throw new HttpException(400, 'Nasiya uchun mijoz tanlanishi shart')
       const cfg = await configOqi()
       if (!cfg.enabled) throw new HttpException(400, "Nasiya savdo sozlamalarda o'chirilgan")
+      if (cfg.passportRequired) {
+        const mijoz = await ClientModel.findByPk(header.client_id, { attributes: ['id', 'passport'] })
+        if (!mijoz) throw new HttpException(404, 'Mijoz topilmadi')
+        if (!mijoz.passport) throw new HttpException(400, 'Nasiya uchun xaridor pasporti kiritilishi shart')
+      }
 
       const naqdJami = items.reduce((s, i) => s + (Number(i.total_sum) || 0), 0)
       const narx     = Math.round(naqdJami - (Number(header.discount) || 0))

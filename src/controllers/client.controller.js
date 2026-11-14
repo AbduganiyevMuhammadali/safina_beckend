@@ -4,6 +4,36 @@ const SaleModel            = require('../models/sale.model')
 const SaleItemModel        = require('../models/sale_item.model')
 const CashTransactionModel = require('../models/cash_transaction.model')
 const HttpException        = require('../utils/HttpException.utils')
+const { normPasport, normPinfl, pasportTogri, pinflTogri } = require('../utils/pasport.utils')
+
+/**
+ * Pasport / JSHSHIR ni tekshiradi: format to'g'rimi va boshqa mijozga
+ * yozilmaganmi. `body` dagi qiymatlarni bir xil ko'rinishga keltiradi.
+ * Boshqa joylarda (nasiya oynasi) ham ishlatiladi.
+ */
+async function pasportTekshir(body, exceptId = null) {
+  if (body.passport !== undefined) {
+    body.passport = normPasport(body.passport)
+    if (body.passport && !pasportTogri(body.passport)) {
+      throw new HttpException(400, "Pasport noto'g'ri: 2 harf va 7 raqam bo'lishi kerak (masalan AA1234567)")
+    }
+  }
+  if (body.pinfl !== undefined) {
+    body.pinfl = normPinfl(body.pinfl)
+    if (body.pinfl && !pinflTogri(body.pinfl)) {
+      throw new HttpException(400, "JSHSHIR noto'g'ri: 14 ta raqam bo'lishi kerak")
+    }
+  }
+  for (const [maydon, nom] of [['passport', 'pasport'], ['pinfl', 'JSHSHIR']]) {
+    if (!body[maydon]) continue
+    const bor = await ClientModel.findOne({ where: { [maydon]: body[maydon] } })
+    if (bor && bor.id !== exceptId) {
+      throw new HttpException(409, `Bu ${nom} boshqa mijozga yozilgan: ${bor.name}`, {
+        code: 'PASPORT_BAND', client_id: bor.id,
+      })
+    }
+  }
+}
 
 class ClientController {
 
@@ -12,10 +42,13 @@ class ClientController {
     const where = {}
     if (active !== undefined && active !== 'all') where.active = active === 'true'
     if (search) {
+      const pas = normPasport(search)
       where[Op.or] = [
         { name:  { [Op.like]: `%${search}%` } },
         { phone: { [Op.like]: `%${search}%` } },
         { code:  { [Op.like]: `%${search}%` } },
+        // Pasport / JSHSHIR bo'yicha ham topiladi (bo'sh joy, kichik harf farq qilmaydi)
+        ...(pas && pas.length >= 4 ? [{ passport: { [Op.like]: `%${pas}%` } }, { pinfl: { [Op.like]: `%${pas}%` } }] : []),
       ]
     }
     const offset = (Number(page) - 1) * Number(limit)
@@ -148,14 +181,18 @@ class ClientController {
   create = async (req, res) => {
     const count = await ClientModel.count()
     const code  = `C-${String(count + 1).padStart(4, '0')}`
-    const client = await ClientModel.create({ ...req.body, code })
+    const body  = { ...req.body }
+    await pasportTekshir(body)
+    const client = await ClientModel.create({ ...body, code })
     res.status(201).json(client)
   }
 
   update = async (req, res) => {
     const client = await ClientModel.findByPk(req.params.id)
     if (!client) throw new HttpException(404, 'Topilmadi')
-    await client.update(req.body)
+    const body = { ...req.body }
+    await pasportTekshir(body, client.id)
+    await client.update(body)
     res.json(client)
   }
 
@@ -168,3 +205,4 @@ class ClientController {
 }
 
 module.exports = new ClientController()
+module.exports.pasportTekshir = pasportTekshir

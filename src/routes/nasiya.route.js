@@ -10,6 +10,11 @@ const perm    = require('../middleware/perm.middleware')
 router.get('/config', auth(), awaitHF(ctrl.getConfig))
 router.put('/config', auth(), perm('settings', 'tahrir'), awaitHF(ctrl.saveConfig))
 
+// Kredit tarixi (pasport / JSHSHIR / mijoz bo'yicha) va pasportni yozib qo'yish.
+// `/:saleId` dan OLDIN turishi shart, aks holda "kredit" id deb olinadi.
+router.get('/kredit',   auth(), awaitHF(ctrl.kredit))
+router.post('/pasport', auth(), perm('sales', 'qoshish'), awaitHF(ctrl.pasportSaqla))
+
 // Shartnomalar — mijoz ma'lumoti, "partners" huquqiga bog'langan
 router.get('/',         auth(), awaitHF(ctrl.list))
 router.get('/:saleId',  auth(), awaitHF(ctrl.getOne))

@@ -49,6 +49,9 @@ module.exports = async function(){
         ['sale',             'installment_markup', 'DECIMAL(18,2) NOT NULL DEFAULT 0'],
         ['sale',             'installment_base',   'DECIMAL(18,2) NOT NULL DEFAULT 0'],
         ['sale_item',        'base_price',         'DECIMAL(15,2) NULL DEFAULT NULL'],
+        // Mijoz pasporti va JSHSHIR — nasiya shartnomasi va kredit tarixi
+        ['client',           'passport',           'VARCHAR(20) NULL DEFAULT NULL'],
+        ['client',           'pinfl',              'VARCHAR(14) NULL DEFAULT NULL'],
     ];
 
     // Nasiya grafigi — har oy uchun bitta satr
@@ -184,6 +187,16 @@ module.exports = async function(){
         try {
             await db.query(`ALTER TABLE \`${table}\` ADD INDEX \`${name}\` ${cols}`);
             console.log(`${table}.${name} indeksi qoshildi`);
+        } catch { /* already exists */ }
+    }
+
+    // Bitta pasport / JSHSHIR faqat bitta mijozda bo'lishi mumkin — aks
+    // holda kredit tarixi ikki kishi orasida bo'linib, noto'g'ri chiqadi.
+    // NULL lar cheklanmaydi (pasporti kiritilmagan mijozlar ko'p bo'ladi).
+    for (const [name, col] of [['uq_client_passport', 'passport'], ['uq_client_pinfl', 'pinfl']]) {
+        try {
+            await db.query(`ALTER TABLE \`client\` ADD UNIQUE INDEX \`${name}\` (\`${col}\`)`);
+            console.log(`client.${name} indeksi qoshildi`);
         } catch { /* already exists */ }
     }
 

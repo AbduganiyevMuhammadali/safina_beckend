@@ -7,6 +7,8 @@ const SalePaymentModel     = require('../models/sale_payment.model')
 const ClientModel          = require('../models/client.model')
 const HttpException        = require('../utils/HttpException.utils')
 const { normalizeConfig, bugunKey } = require('../utils/nasiya.utils')
+const { normPasport, normPinfl, pasportTogri, pinflTogri } = require('../utils/pasport.utils')
+const { pasportTekshir } = require('./client.controller')
 
 const CONFIG_KEY = 'nasiya_config'
 const r2 = v => Math.round((Number(v) || 0) * 100) / 100
@@ -22,6 +24,154 @@ async function configOqi() {
 
 function kunFarqi(a, b) {
   return Math.round((new Date(a) - new Date(b)) / 86400000)
+}
+
+const sonM = v => new Intl.NumberFormat('ru-RU').format(Math.round(Number(v) || 0)).replace(/\s/g, ' ')
+// Muddatidan shuncha kun keyin to'langan oy "kechikkan" hisoblanadi
+const KECHIKISH_CHEGARA = 3
+
+function sanaKeyD(d) {
+  const x = new Date(d)
+  return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`
+}
+
+/**
+ * Mijozning do'kondagi kredit tarixi va reytingi.
+ *
+ * Asos — shu do'konning o'z ma'lumotlari: nasiya shartnomalari (har oy
+ * qachon to'langani), oddiy qarzlar va mijoz statusi. Reyting 0–100 ball,
+ * har bir chegirma sababi bilan ko'rsatiladi — kassir nima uchun shunday
+ * baho chiqqanini ko'rib turadi.
+ */
+async function kreditHisobla(client) {
+  const bugun = bugunKey()
+  const sales = await SaleModel.findAll({
+    where: { client_id: client.id, status: { [Op.ne]: 'cancelled' } },
+    include: [{ model: SaleItemModel, as: 'items', attributes: ['product_name'] }],
+    order: [['date', 'DESC']],
+  })
+  const nasiyalar = sales.filter(s => Number(s.installment_months) > 0)
+  const oylarRaw = nasiyalar.length ? await SaleInstallmentModel.findAll({
+    where: { sale_id: { [Op.in]: nasiyalar.map(s => s.id) } }, order: [['no', 'ASC']], raw: true,
+  }) : []
+  const bySale = new Map()
+  for (const g of oylarRaw) {
+    if (!bySale.has(g.sale_id)) bySale.set(g.sale_id, [])
+    bySale.get(g.sale_id).push(g)
+  }
+
+  // ── Nasiya shartnomalari ────────────────────────────────────────
+  let kechTolov = 0, engKopKech = 0, vaqtidaTolov = 0
+  const shartnomalar = nasiyalar.map(s => {
+    const oylar = bySale.get(s.id) || []
+    const h = holatHisobla(s, oylar, bugun)
+    for (const g of oylar) {
+      if (!g.paid_at || !(Number(g.amount) > 0)) continue
+      const kech = kunFarqi(sanaKeyD(g.paid_at), String(g.due_date).slice(0, 10))
+      if (kech > KECHIKISH_CHEGARA) { kechTolov++; engKopKech = Math.max(engKopKech, kech) }
+      else vaqtidaTolov++
+    }
+    return {
+      id: s.id, docNumber: s.doc_number, date: s.date,
+      months: s.installment_months, narx: Number(s.installment_base) || 0,
+      tovarlar: (s.items || []).map(i => i.product_name).join(', '),
+      jami: h.jami, tolangan: h.tolangan, qolgan: h.qolgan,
+      kechikkan: h.kechikkan, kechikkanKun: h.kechikkanKun, holat: h.holat,
+    }
+  })
+
+  // ── Oddiy qarzlar (nasiyasiz) ───────────────────────────────────
+  let oddiyQarz = 0, oddiyKech = 0, oddiyKechKun = 0
+  for (const s of sales) {
+    if (Number(s.installment_months) > 0) continue
+    const q = r2(Number(s.debt_sum) - Number(s.debt_paid))
+    if (q <= TIYIN) continue
+    oddiyQarz = r2(oddiyQarz + q)
+    const due = s.due_date ? String(s.due_date).slice(0, 10) : null
+    if (due && due < bugun) {
+      oddiyKech = r2(oddiyKech + q)
+      oddiyKechKun = Math.max(oddiyKechKun, kunFarqi(bugun, due))
+    }
+  }
+
+  const faol      = shartnomalar.filter(x => x.holat !== 'yopilgan')
+  const yopilgan  = shartnomalar.filter(x => x.holat === 'yopilgan')
+  const kechikkan = r2(shartnomalar.reduce((a, x) => a + x.kechikkan, 0) + oddiyKech)
+  const kechKun   = Math.max(0, oddiyKechKun, ...shartnomalar.map(x => x.kechikkanKun))
+  const qolgan    = r2(faol.reduce((a, x) => a + x.qolgan, 0) + oddiyQarz)
+
+  const jami = {
+    xaridlar: sales.length,
+    birinchiXarid: sales.length ? sales[sales.length - 1].date : null,
+    shartnomalar: shartnomalar.length,
+    faol: faol.length,
+    yopilgan: yopilgan.length,
+    nasiyaJami: r2(shartnomalar.reduce((a, x) => a + x.jami, 0)),
+    tolangan: r2(shartnomalar.reduce((a, x) => a + x.tolangan, 0)),
+    qolgan, oddiyQarz, kechikkan, kechikkanKun: kechKun,
+    kechTolov, vaqtidaTolov, engKopKech,
+  }
+
+  // ── Reyting ─────────────────────────────────────────────────────
+  const sabablar = []
+  const status = client.status || 'faol'
+  const tarixBor = sales.length > 0
+  let ball = 100
+
+  if (yopilgan.length) {
+    ball += Math.min(10, yopilgan.length * 5)
+    sabablar.push({ tur: 'ok', matn: `${yopilgan.length} ta nasiya to'liq yopilgan` })
+  }
+  if (faol.length) {
+    sabablar.push({ tur: 'info', matn: `${faol.length} ta faol shartnoma — qolgan ${sonM(faol.reduce((a, x) => a + x.qolgan, 0))} so'm` })
+  }
+  if (kechTolov) {
+    ball -= Math.min(30, kechTolov * 6)
+    if (engKopKech > 30) ball -= 10
+    sabablar.push({ tur: 'warn', matn: `${kechTolov} marta kechiktirib to'lagan (eng ko'pi ${engKopKech} kun)` })
+  } else if (vaqtidaTolov) {
+    sabablar.push({ tur: 'ok', matn: `Barcha ${vaqtidaTolov} ta oylik to'lov o'z vaqtida` })
+  }
+  if (kechikkan > TIYIN) {
+    ball -= kechKun > 60 ? 50 : kechKun > 30 ? 35 : 20
+    sabablar.push({ tur: 'bad', matn: `Hozir ${kechKun} kun kechikkan: ${sonM(kechikkan)} so'm` })
+  }
+  if (oddiyQarz > TIYIN) {
+    sabablar.push({ tur: oddiyKech > TIYIN ? 'bad' : 'info', matn: `Oddiy qarzi: ${sonM(oddiyQarz)} so'm` })
+  }
+  if (status === 'muammoli') { ball -= 20; sabablar.push({ tur: 'bad', matn: 'Mijoz "muammoli" deb belgilangan' }) }
+  if (status === 'ishonchli') { ball += 5; sabablar.push({ tur: 'ok', matn: 'Mijoz "ishonchli" deb belgilangan' }) }
+  ball = Math.max(0, Math.min(100, Math.round(ball)))
+
+  let reyting
+  if (status === 'qora') {
+    ball = 0
+    sabablar.unshift({ tur: 'bad', matn: "Qora ro'yxatda" })
+    reyting = { daraja: 'qora', nom: "Qora ro'yxat", tavsiya: 'Nasiya berilmaydi' }
+  } else if (!tarixBor) {
+    reyting = { daraja: 'yangi', nom: "Tarix yo'q", tavsiya: "Birinchi xaridi — oldindan to'lovni standartdan kam qilmaslik tavsiya etiladi" }
+  } else if (ball >= 85) {
+    reyting = { daraja: 'alo', nom: "A'lo", tavsiya: 'Ishonchli mijoz — nasiya berish mumkin' }
+  } else if (ball >= 70) {
+    reyting = { daraja: 'yaxshi', nom: 'Yaxshi', tavsiya: 'Nasiya berish mumkin' }
+  } else if (ball >= 50) {
+    reyting = { daraja: 'orta', nom: "O'rtacha", tavsiya: "Ehtiyot bo'ling — oldindan to'lovni oshirish tavsiya etiladi" }
+  } else if (ball >= 25) {
+    reyting = { daraja: 'xavfli', nom: 'Xavfli', tavsiya: "Avval kechikkan qarzni yopishni so'rang" }
+  } else {
+    reyting = { daraja: 'juda_xavfli', nom: 'Juda xavfli', tavsiya: 'Nasiya berish tavsiya etilmaydi' }
+  }
+  reyting.ball = tarixBor || status === 'qora' ? ball : null
+
+  return { reyting, sabablar, jami, shartnomalar: shartnomalar.slice(0, 20) }
+}
+
+function mijozKorinish(c) {
+  return {
+    id: c.id, name: c.name, phone: c.phone || '', address: c.address || '',
+    passport: c.passport || '', pinfl: c.pinfl || '',
+    status: c.status || 'faol', balance: Number(c.balance) || 0,
+  }
 }
 
 /**
@@ -65,6 +215,45 @@ class NasiyaController {
     res.json(await configOqi())
   }
 
+  /**
+   * GET /api/v1/nasiya/kredit?passport=AA1234567 | ?pinfl=… | ?client_id=…
+   * Mijozning do'kondagi kredit tarixi. Topilmasa { topildi: false }.
+   */
+  kredit = async (req, res) => {
+    const pas = normPasport(req.query.passport)
+    const pin = normPinfl(req.query.pinfl)
+    const cid = Number(req.query.client_id) || null
+    if (pas && !pasportTogri(pas)) throw new HttpException(400, "Pasport noto'g'ri: 2 harf va 7 raqam (AA1234567)")
+    if (pin && !pinflTogri(pin)) throw new HttpException(400, "JSHSHIR 14 ta raqam bo'lishi kerak")
+    if (!pas && !pin && !cid) throw new HttpException(400, 'Pasport, JSHSHIR yoki mijoz kerak')
+
+    const or = []
+    if (pas) or.push({ passport: pas })
+    if (pin) or.push({ pinfl: pin })
+    if (cid) or.push({ id: cid })
+    const client = await ClientModel.findOne({ where: { [Op.or]: or } })
+    if (!client) return res.json({ topildi: false })
+
+    res.json({ topildi: true, client: mijozKorinish(client), ...(await kreditHisobla(client)) })
+  }
+
+  /**
+   * POST /api/v1/nasiya/pasport { client_id, passport, pinfl }
+   * Nasiya rasmiylashtirilayotganda mijozga pasport yozib qo'yish.
+   * Kassirda mijozlarni tahrirlash huquqi bo'lmasa ham ishlaydi — faqat
+   * shu ikki maydon o'zgaradi.
+   */
+  pasportSaqla = async (req, res) => {
+    const client = await ClientModel.findByPk(req.body.client_id)
+    if (!client) throw new HttpException(404, 'Mijoz topilmadi')
+    const body = {}
+    if (req.body.passport !== undefined) body.passport = req.body.passport
+    if (req.body.pinfl !== undefined) body.pinfl = req.body.pinfl
+    await pasportTekshir(body, client.id)
+    await client.update(body)
+    res.json(mijozKorinish(client))
+  }
+
   /** PUT /api/v1/nasiya/config */
   saveConfig = async (req, res) => {
     const cfg = normalizeConfig(req.body)
@@ -86,9 +275,14 @@ class NasiyaController {
     const where = { installment_months: { [Op.gt]: 0 }, status: { [Op.ne]: 'cancelled' } }
     if (search) {
       const q = String(search).trim()
+      const pas = normPasport(q)
       const clients = await ClientModel.findAll({
         attributes: ['id'],
-        where: { [Op.or]: [{ name: { [Op.like]: `%${q}%` } }, { phone: { [Op.like]: `%${q}%` } }] },
+        where: { [Op.or]: [
+          { name: { [Op.like]: `%${q}%` } },
+          { phone: { [Op.like]: `%${q}%` } },
+          ...(pas && pas.length >= 4 ? [{ passport: { [Op.like]: `%${pas}%` } }, { pinfl: { [Op.like]: `%${pas}%` } }] : []),
+        ] },
         raw: true, limit: 200,
       })
       where[Op.or] = [
@@ -186,10 +380,7 @@ class NasiyaController {
       narx: Number(sale.installment_base) || 0,
       chegirma: Number(sale.discount) || 0,
       oldindan: Number(sale.paid_sum) || 0,
-      client: sale.client ? {
-        id: sale.client.id, name: sale.client.name, phone: sale.client.phone,
-        address: sale.client.address || '',
-      } : null,
+      client: sale.client ? mijozKorinish(sale.client) : null,
       items: (sale.items || []).map(i => ({
         name: i.product_name,
         qty: Number(i.qty) || 0,
