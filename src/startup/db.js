@@ -153,6 +153,18 @@ module.exports = async function(){
         } catch { /* already exists */ }
     }
 
+    // Eski nasiya to'lovlari kassada "nasiya" turi bilan belgilansin
+    // (ilgari hammasi oddiy "qarz to'lovi" bo'lib yozilardi). Takror
+    // ishga tushsa hech narsa o'zgarmaydi.
+    try {
+        const [r] = await db.query(`
+          UPDATE cash_transaction ct SET ct.reference_type = 'nasiya'
+          WHERE ct.type = 'debt_payment' AND (ct.reference_type IS NULL OR ct.reference_type = 'sale')
+            AND EXISTS (SELECT 1 FROM sale_payment sp JOIN sale s ON s.id = sp.sale_id
+                        WHERE sp.cash_transaction_id = ct.id AND s.installment_months > 0)`);
+        if (r?.affectedRows) console.log(`kassa: ${r.affectedRows} ta to'lov "nasiya" deb belgilandi`);
+    } catch (e) { console.log('kassa nasiya belgisi:', e.message); }
+
     // Indekslar — mahsulot ko'payganda sotuv sahifasi sekinlashmasligi uchun.
     // `product.name` bo'yicha indekssiz har so'rovda butun jadval saralanardi
     // (Table scan + Sort). Mavjud bo'lsa xato beradi, uni e'tiborsiz qoldiramiz.

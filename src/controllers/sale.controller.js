@@ -800,8 +800,13 @@ class SaleController {
       include: [{ model: ClientModel, as: 'client', attributes: ['id', 'name'], required: false }],
     })
 
-    const summary    = { income: 0, expense: 0, sale: 0, refund: 0, debt_payment: 0, net: 0 }
-    const summaryUSD = { income: 0, expense: 0, sale: 0, refund: 0, debt_payment: 0, net: 0 }
+    // `nasiya` — debt_payment ning nasiya shartnomalariga tushgan qismi
+    // (debt_payment jamisiga ham kiradi). `opening` — kassa ochilish qoldig'i.
+    const summary    = { income: 0, expense: 0, sale: 0, refund: 0, debt_payment: 0, nasiya: 0, opening: 0, net: 0 }
+    const summaryUSD = { income: 0, expense: 0, sale: 0, refund: 0, debt_payment: 0, nasiya: 0, opening: 0, net: 0 }
+    // To'lov turi bo'yicha: kassadagi naqd pul kartadan alohida ko'rinsin
+    const byPay = {}
+    for (const pt of ['Naqd', 'Karta', "O'tkazma"]) byPay[pt] = { kirim: 0, chiqim: 0, sof: 0 }
 
     txns.forEach(t => {
       const amt    = Number(t.amount)
@@ -810,6 +815,13 @@ class SaleController {
         summary[t.type]    += amt
         summaryUSD[t.type] += amtUSD
       }
+      if (t.type === 'debt_payment' && t.reference_type === 'nasiya') {
+        summary.nasiya    += amt
+        summaryUSD.nasiya += amtUSD
+      }
+      const bp = byPay[t.payment_type] || byPay.Naqd
+      if (['income', 'sale', 'debt_payment'].includes(t.type)) bp.kirim += amt
+      else if (['expense', 'refund'].includes(t.type))          bp.chiqim += amt
       if (['income', 'sale', 'debt_payment'].includes(t.type)) {
         summary.net    += amt
         summaryUSD.net += amtUSD
@@ -819,7 +831,8 @@ class SaleController {
       }
     })
 
-    res.json({ transactions: txns, summary, summaryUSD })
+    for (const v of Object.values(byPay)) v.sof = v.kirim - v.chiqim
+    res.json({ transactions: txns, summary, summaryUSD, byPay })
   }
 
   // ── Product report (inventory by batch) ──────────────────────
@@ -901,27 +914,45 @@ class SaleController {
         cashierName,
         cashTransactionId: tx.id,
       })
-    })
 
-    await KassaRegisterModel.create({
-      date:          now,
-      sale_id:       null,
-      doc_number:    null,
-      warehouse:     'Asosiy ombor',
-      payment_type:  safePayType,
-      price_type:    'chakana',
-      total_sum:     0,
-      paid_sum:      paidAmount,
-      debt_sum:      0,
-      discount:      0,
-      item_count:    0,
-      client_id,
-      client_name:   client.name,
-      cashier_id:    cashierId,
-      cashier_name:  cashierName,
-      status:        'completed',
-      exchange_rate: rate,
-      total_usd:     rate > 0 ? +(paidAmount / rate).toFixed(4) : 0,
+      // Kassa yozuvi aniq bo'lsin: qaysi shartnoma, qaysi oylar yopildi.
+      // Nasiya oylari yopilgan bo'lsa — "nasiya" turi (kassada alohida
+      // "Nasiya to'lovi" bo'lib ko'rinadi va alohida jamlanadi).
+      const sotuvlar  = taqsimot.sotuvlar || []
+      const nasiyalar = sotuvlar.filter(x => x.oylar?.length)
+      const qismlar = [
+        ...nasiyalar.map(n => `nasiya #${n.doc_number} (${n.oylar.map(o => o.no).join(', ')}-oy)`),
+        ...sotuvlar.filter(x => !x.oylar?.length).map(o => `qarz #${o.doc_number}`),
+      ]
+      if (taqsimot.ortiqcha > 0.005) qismlar.push(`avans ${Math.round(taqsimot.ortiqcha).toLocaleString('ru-RU')}`)
+      const avto = `${client.name} — ${qismlar.join(', ') || "qarz to'lovi"}`
+      await tx.update({
+        description:    description ? `${avto} · ${description}` : avto,
+        reference_type: nasiyalar.length ? 'nasiya' : (sotuvlar.length ? 'sale' : null),
+        reference_id:   sotuvlar.length === 1 ? sotuvlar[0].sale_id : (shartnoma ? shartnoma.id : null),
+      }, { transaction: t })
+
+      // Kassa reyestri ham shu tranzaksiyada — yarim yozilgan holat qolmasin
+      await KassaRegisterModel.create({
+        date:          now,
+        sale_id:       null,
+        doc_number:    null,
+        warehouse:     'Asosiy ombor',
+        payment_type:  safePayType,
+        price_type:    'chakana',
+        total_sum:     0,
+        paid_sum:      paidAmount,
+        debt_sum:      0,
+        discount:      0,
+        item_count:    0,
+        client_id,
+        client_name:   client.name,
+        cashier_id:    cashierId,
+        cashier_name:  cashierName,
+        status:        'completed',
+        exchange_rate: rate,
+        total_usd:     rate > 0 ? +(paidAmount / rate).toFixed(4) : 0,
+      }, { transaction: t })
     })
 
     res.json({ client, taqsimot, message: 'Qarz qayd etildi' })
