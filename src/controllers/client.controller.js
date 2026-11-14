@@ -63,6 +63,15 @@ class ClientController {
       order: [['date', 'ASC']],
     })
 
+    // Balans hisobiga kiradigan sotuvlar. Bekor qilingan sotuv odatda
+    // chiqariladi (unga qilingan to'lovlar mijoz foydasiga qoladi). Lekin
+    // QAYTARISH orqali to'liq yopilgan qarzli sotuvda mijoz to'lagan pul
+    // naqd qaytarilgan — u sotuv hisobda qolmasa, to'lovlari "ortiqcha"
+    // bo'lib ko'rinib, balans noto'g'ri to'g'rilanib qolardi.
+    const hisobda = s => s.status !== 'cancelled'
+      || (Number(s.returned_sum) > 0
+          && Number(s.debt_sum) - Number(s.debt_paid || 0) <= 0.005)
+
     // Merge and sort by date
     const entries = []
     for (const s of sales) {
@@ -76,6 +85,7 @@ class ClientController {
         credit:       Number(s.paid_sum)  || 0,
         debt:         Number(s.debt_sum)  || 0,
         status:       s.status,
+        hisobda:      hisobda(s),
         items_count:  s.items?.length ?? 0,
         sale_id:      s.id,
       })
@@ -100,7 +110,7 @@ class ClientController {
     // Compute running balance (negative = owes)
     let running = 0
     for (const e of entries) {
-      if (e.status === 'cancelled') {
+      if (e.type === 'sale' && !e.hisobda) {
         e.running_balance = running
         continue
       }
@@ -114,7 +124,7 @@ class ClientController {
 
     // Recompute balance from DB to be authoritative
     const totalDebt = sales
-      .filter(s => s.status !== 'cancelled')
+      .filter(hisobda)
       .reduce((s, x) => s + (Number(x.debt_sum) || 0), 0)
     const totalPaid = payments.reduce((s, x) => s + (Number(x.amount) || 0), 0)
     const computedBalance = totalPaid - totalDebt

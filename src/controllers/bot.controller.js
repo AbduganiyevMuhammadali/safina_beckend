@@ -137,12 +137,12 @@ class BotController {
     const [qarz] = await sequelize.query(`
       SELECT
         SUM(CASE WHEN due_date = ? THEN 1 ELSE 0 END) bugun_n,
-        SUM(CASE WHEN due_date = ? THEN debt_sum ELSE 0 END) bugun_s,
+        SUM(CASE WHEN due_date = ? THEN debt_sum - debt_paid ELSE 0 END) bugun_s,
         SUM(CASE WHEN due_date < ? THEN 1 ELSE 0 END) kech_n,
-        SUM(CASE WHEN due_date < ? THEN debt_sum ELSE 0 END) kech_s,
-        COUNT(*) jami_n, SUM(debt_sum) jami_s
+        SUM(CASE WHEN due_date < ? THEN debt_sum - debt_paid ELSE 0 END) kech_s,
+        COUNT(*) jami_n, SUM(debt_sum - debt_paid) jami_s
       FROM sale
-      WHERE debt_sum > 0 AND status <> 'cancelled'
+      WHERE debt_sum - debt_paid > 0.005 AND status <> 'cancelled'
     `, { replacements: [bugun, bugun, bugun, bugun] }).catch(() => [[{}]])
     const q = (qarz && qarz[0]) || {}
 
@@ -195,13 +195,13 @@ class BotController {
 
     const [rows] = await sequelize.query(`
       SELECT c.name, c.phone,
-             SUM(s.debt_sum) qarz,
+             SUM(s.debt_sum - s.debt_paid) qarz,
              MIN(s.due_date)  muddat,
              MIN(s.date)      birinchi_xarid,
              MAX(s.date)      oxirgi_xarid,
              COUNT(*)         hujjatlar
         FROM sale s JOIN client c ON c.id = s.client_id
-       WHERE s.debt_sum > 0 AND s.status <> 'cancelled' ${shart}
+       WHERE s.debt_sum - s.debt_paid > 0.005 AND s.status <> 'cancelled' ${shart}
        GROUP BY s.client_id
        ORDER BY (MIN(s.due_date) IS NULL), MIN(s.due_date) ASC
        LIMIT 40

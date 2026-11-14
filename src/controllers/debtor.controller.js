@@ -68,17 +68,19 @@ class DebtorController {
     const bugun = bugunKey()
 
     // Qarzli sotuvlarni mijoz kesimida yig'amiz.
-    // `debt_sum > 0` va bekor qilinmagan sotuvlar hisobga olinadi.
+    // Qolgan qarz = debt_sum − debt_paid (to'lovlar sotuvlarga
+    // taqsimlanadi). Bekor qilinmagan va qarzi qolgan sotuvlar olinadi.
+    // Nasiyada `due_date` — navbatdagi to'lanmagan oy sanasi.
     const rows = await SaleModel.findAll({
       attributes: [
         'client_id',
-        [fn('SUM', col('debt_sum')), 'qarz'],
+        [fn('SUM', literal('debt_sum - debt_paid')), 'qarz'],
         [fn('COUNT', col('id')),     'sotuvlar'],
         [fn('MIN', col('due_date')), 'eng_yaqin'],
         [fn('MAX', col('date')),     'oxirgi_sotuv'],
       ],
       where: {
-        debt_sum: { [Op.gt]: 0 },
+        [Op.and]: [literal('debt_sum - debt_paid > 0.005')],
         client_id: { [Op.ne]: null },
         status: { [Op.ne]: 'cancelled' },
       },
@@ -177,20 +179,21 @@ class DebtorController {
 
     const bugun = bugunKey()
 
-    // Qarzli sotuvlar
+    // Qarzi qolgan sotuvlar
     const sales = await SaleModel.findAll({
       where: {
         client_id: id,
-        debt_sum: { [Op.gt]: 0 },
+        [Op.and]: [literal('debt_sum - debt_paid > 0.005')],
         status: { [Op.ne]: 'cancelled' },
       },
       order: [['due_date', 'ASC'], ['date', 'ASC']],
     })
 
-    // To'lovlar tarixi
+    // To'lovlar tarixi. Ilgari `reference_id` bo'yicha qidirilardi, lekin
+    // to'lovda mijoz `client_id` ga yoziladi — tarix doim bo'sh chiqardi.
     const CashTransactionModel = require('../models/cash_transaction.model')
     const payments = await CashTransactionModel.findAll({
-      where: { type: 'debt_payment', reference_id: id },
+      where: { type: 'debt_payment', client_id: id },
       order: [['date', 'DESC']],
       limit: 100,
     }).catch(() => [])
@@ -214,9 +217,11 @@ class DebtorController {
         docNumber: s.doc_number,
         date: s.date,
         total: Number(s.total_sum) || 0,
-        debt: Number(s.debt_sum) || 0,
+        debt: +((Number(s.debt_sum) || 0) - (Number(s.debt_paid) || 0)).toFixed(2),
         dueDate: s.due_date ? String(s.due_date).slice(0, 10) : null,
         muddat: muddatToifasi(s.due_date, bugun),
+        // Nasiya bo'lsa — grafik Nasiya bo'limida, muddat oylar bo'yicha yuradi
+        nasiyaOy: Number(s.installment_months) || 0,
       })),
       tolovlar: (payments || []).map(p => ({
         id: p.id, date: p.date,
@@ -259,7 +264,12 @@ class DebtorController {
   updateDue = async (req, res) => {
     const sale = await SaleModel.findByPk(req.params.saleId)
     if (!sale) throw new HttpException(404, 'Sotuv topilmadi')
-    if (Number(sale.debt_sum) <= 0) throw new HttpException(400, 'Bu sotuvda qarz yo\'q')
+    if (Number(sale.debt_sum) - Number(sale.debt_paid) <= 0.005) throw new HttpException(400, 'Bu sotuvda qarz yo\'q')
+    // Nasiyada muddat grafik bo'yicha avtomatik yuradi — qo'lda surilsa
+    // navbatdagi to'lovdan keyin baribir qaytib ketadi va chalkashtiradi
+    if (Number(sale.installment_months) > 0) {
+      throw new HttpException(400, "Bu nasiya shartnomasi — muddat oylik grafik bo'yicha yuradi")
+    }
 
     const d = req.body.due_date || null
     if (d && !/^\d{4}-\d{2}-\d{2}$/.test(d)) throw new HttpException(400, 'Sana formati noto\'g\'ri')

@@ -17,8 +17,19 @@ SaleModel.init({
   debt_sum:     { type: DataTypes.DECIMAL(18, 2), defaultValue: 0 },
   // Qisman qaytarishlar yig'indisi (chegirma hisobga olingan holda)
   returned_sum: { type: DataTypes.DECIMAL(18, 2), defaultValue: 0 },
-  // Qarzni to'lash muddati — har sotuvga alohida belgilanadi
+  // Qarzni to'lash muddati — har sotuvga alohida belgilanadi.
+  // Nasiyada — grafikdagi navbatdagi to'lanmagan oy sanasi.
   due_date:     { type: DataTypes.DATEONLY, allowNull: true },
+  // Shu sotuv qarziga yozilgan to'lovlar. `debt_sum` dastlabki qarz
+  // bo'lib qoladi (mijoz hisob varag'i shunga tayanadi), qolgan qarz =
+  // debt_sum − debt_paid.
+  debt_paid:    { type: DataTypes.DECIMAL(18, 2), defaultValue: 0 },
+  // Nasiya (muddatli to'lov). `installment_months` bo'sh bo'lsa — oddiy sotuv
+  installment_months:  { type: DataTypes.INTEGER, allowNull: true },
+  installment_percent: { type: DataTypes.DECIMAL(7, 3), allowNull: true },
+  installment_markup:  { type: DataTypes.DECIMAL(18, 2), defaultValue: 0 },
+  // Naqd narx (chegirmadan keyin, ustamasiz) — shartnomada ko'rsatiladi
+  installment_base:    { type: DataTypes.DECIMAL(18, 2), defaultValue: 0 },
   cashier_id:   { type: DataTypes.INTEGER, allowNull: true },
   status:       { type: DataTypes.ENUM('draft', 'completed', 'cancelled'), defaultValue: 'completed' },
   comment:      { type: DataTypes.TEXT, allowNull: true },

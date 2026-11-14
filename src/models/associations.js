@@ -17,6 +17,12 @@ SaleItemModel.belongsTo(SaleModel, { foreignKey: 'sale_id',     as: 'sale'     }
 // Sale ↔ Client
 SaleModel.belongsTo(ClientModel,   { foreignKey: 'client_id',   as: 'client'   })
 
+// Sale ↔ nasiya grafigi va to'lovlari
+const SaleInstallmentModel = require('./sale_installment.model')
+const SalePaymentModel     = require('./sale_payment.model')
+SaleModel.hasMany(SaleInstallmentModel, { foreignKey: 'sale_id', as: 'installments' })
+SaleModel.hasMany(SalePaymentModel,     { foreignKey: 'sale_id', as: 'payments'     })
+
 // Purchase ↔ PurchaseItem
 PurchaseModel.hasMany(PurchaseItemModel,   { foreignKey: 'purchase_id', as: 'items'    })
 PurchaseItemModel.belongsTo(PurchaseModel, { foreignKey: 'purchase_id', as: 'purchase' })

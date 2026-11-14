@@ -15,6 +15,8 @@ SaleItemModel.init({
   // bir tovarni bir necha marta (qismlab) qaytarish mumkin.
   returned_qty: { type: DataTypes.DECIMAL(15, 3), defaultValue: 0 },
   price:            { type: DataTypes.DECIMAL(15, 2), defaultValue: 0 },
+  // Nasiyada ustamasiz naqd narx (`price` ga ustama qo'shilgan bo'ladi)
+  base_price:       { type: DataTypes.DECIMAL(15, 2), allowNull: true },
   cost_price:       { type: DataTypes.DECIMAL(15, 2), defaultValue: 0 },
   total_sum:        { type: DataTypes.DECIMAL(18, 2), defaultValue: 0 },
   price_type:       { type: DataTypes.ENUM('chakana', 'ulgurji'), defaultValue: 'chakana' },

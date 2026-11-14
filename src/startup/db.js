@@ -41,7 +41,52 @@ module.exports = async function(){
         ['sale_item',        'returned_qty',       'DECIMAL(15,3) NOT NULL DEFAULT 0'],
         // Sotuvdan jami qaytarilgan summa (chegirma hisobga olingan)
         ['sale',             'returned_sum',       'DECIMAL(18,2) NOT NULL DEFAULT 0'],
+        // Qarzga yozilgan to'lovlar (qolgan qarz = debt_sum − debt_paid)
+        ['sale',             'debt_paid',          'DECIMAL(18,2) NOT NULL DEFAULT 0'],
+        // Nasiya (muddatli to'lov)
+        ['sale',             'installment_months', 'INT NULL DEFAULT NULL'],
+        ['sale',             'installment_percent','DECIMAL(7,3) NULL DEFAULT NULL'],
+        ['sale',             'installment_markup', 'DECIMAL(18,2) NOT NULL DEFAULT 0'],
+        ['sale',             'installment_base',   'DECIMAL(18,2) NOT NULL DEFAULT 0'],
+        ['sale_item',        'base_price',         'DECIMAL(15,2) NULL DEFAULT NULL'],
     ];
+
+    // Nasiya grafigi — har oy uchun bitta satr
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS \`sale_installment\` (
+        \`id\`         INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        \`sale_id\`    INT NOT NULL,
+        \`client_id\`  INT DEFAULT NULL,
+        \`no\`         INT NOT NULL,
+        \`due_date\`   DATE NOT NULL,
+        \`amount\`     DECIMAL(18,2) NOT NULL DEFAULT 0,
+        \`paid\`       DECIMAL(18,2) NOT NULL DEFAULT 0,
+        \`paid_at\`    DATETIME DEFAULT NULL,
+        \`created_at\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX \`idx_inst_sale\` (\`sale_id\`, \`no\`),
+        INDEX \`idx_inst_client_due\` (\`client_id\`, \`due_date\`),
+        INDEX \`idx_inst_due\` (\`due_date\`)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
+
+    // Qarz to'lovining qaysi sotuvga yozilgani (shartnoma to'lovlari tarixi)
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS \`sale_payment\` (
+        \`id\`                  INT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+        \`sale_id\`             INT NOT NULL,
+        \`client_id\`           INT DEFAULT NULL,
+        \`cash_transaction_id\` INT DEFAULT NULL,
+        \`date\`                DATETIME DEFAULT NULL,
+        \`amount\`              DECIMAL(18,2) NOT NULL DEFAULT 0,
+        \`payment_type\`        VARCHAR(20) DEFAULT NULL,
+        \`cashier_name\`        VARCHAR(100) DEFAULT NULL,
+        \`created_at\`          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        \`updated_at\`          DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX \`idx_sp_sale\` (\`sale_id\`),
+        INDEX \`idx_sp_client\` (\`client_id\`)
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+    `);
 
     // supplier jadvalini yaratish (mavjud bo'lmasa)
     await db.query(`
@@ -132,6 +177,8 @@ module.exports = async function(){
         ['product_register', 'idx_pr_date',           '(`date`)'],
         ['product_register', 'idx_pr_pitem',          '(`purchase_item_id`)'],
         ['cash_transaction', 'idx_ct_date',           '(`date`)'],
+        // Nasiya shartnomalari ro'yxati
+        ['sale',             'idx_sale_installment',  '(`installment_months`, `status`)'],
     ];
     for (const [table, name, cols] of indexes) {
         try {

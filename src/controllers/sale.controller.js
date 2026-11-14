@@ -12,6 +12,34 @@ const KassaRegisterModel    = require('../models/kassa_register.model')
 const HttpException         = require('../utils/HttpException.utils')
 const { dateRange }         = require('../utils/dateRange.utils')
 const { barcodeVariants }   = require('../utils/barcode.utils')
+const SaleInstallmentModel  = require('../models/sale_installment.model')
+const { hisobla, grafikTuz, oyQosh, bugunKey } = require('../utils/nasiya.utils')
+const { tolovniTaqsimla, grafikniKamaytir, navbatdagiSana, qolgan } = require('../utils/qarzTaqsim.utils')
+const { configOqi }         = require('./nasiya.controller')
+
+// Nasiya ustamasini savat satrlariga summasiga mutanosib taqsimlaydi.
+// Sotuv shu narxda yoziladi — shunda tushum, foyda, qaytarish va mijoz
+// balansi hech qanday qo'shimcha hisobsiz to'g'ri chiqadi. Asl naqd narx
+// `base_price` da saqlanadi (shartnoma va chekda ko'rsatiladi).
+function ustamaniTaqsimla(items, ustama, naqdJami) {
+  let qoldi = ustama
+  // Yaxlitlash qoldig'i eng katta satrga tushadi
+  let kattaIdx = 0
+  items.forEach((it, i) => { if (Number(it.total_sum) > Number(items[kattaIdx].total_sum)) kattaIdx = i })
+  const ulushlar = items.map((it, i) => {
+    if (i === kattaIdx) return 0
+    const u = Math.round(ustama * (Number(it.total_sum) || 0) / naqdJami)
+    qoldi -= u
+    return u
+  })
+  ulushlar[kattaIdx] = qoldi
+  items.forEach((it, i) => {
+    const asl = Number(it.total_sum) || 0
+    it.base_price = Number(it.price) || 0
+    it.total_sum  = +(asl + ulushlar[i]).toFixed(2)
+    if (Number(it.qty) > 0) it.price = +(it.total_sum / Number(it.qty)).toFixed(2)
+  })
+}
 
 class SaleController {
 
@@ -154,7 +182,9 @@ class SaleController {
       include: [
         { model: ClientModel,   as: 'client' },
         { model: SaleItemModel, as: 'items'  },
+        { model: SaleInstallmentModel, as: 'installments' },
       ],
+      order: [[{ model: SaleInstallmentModel, as: 'installments' }, 'no', 'ASC']],
     })
     if (!sale) throw new HttpException(404, 'Topilmadi')
 
@@ -189,6 +219,53 @@ class SaleController {
 
     // Exchange rate: sent from frontend settings, fallback 0 (= so'm only)
     const rate = Number(header.exchange_rate) || 0
+
+    // ── NASIYA (muddatli to'lov) ─────────────────────────────────
+    // Frontend { months, first_due, expected_debt } yuboradi. Hisob
+    // serverda qaytadan qilinadi (foizlar faqat sozlamadan olinadi),
+    // frontend kutgan summa bilan solishtiriladi.
+    const nasiyaSorov = header.installment
+    delete header.installment
+    let nasiyaGrafik = null
+    if (nasiyaSorov && Number(nasiyaSorov.months) > 0) {
+      if (!header.client_id) throw new HttpException(400, 'Nasiya uchun mijoz tanlanishi shart')
+      const cfg = await configOqi()
+      if (!cfg.enabled) throw new HttpException(400, "Nasiya savdo sozlamalarda o'chirilgan")
+
+      const naqdJami = items.reduce((s, i) => s + (Number(i.total_sum) || 0), 0)
+      const narx     = Math.round(naqdJami - (Number(header.discount) || 0))
+      if (!(narx > 0)) throw new HttpException(400, "Nasiya summasi noto'g'ri")
+      const oldindan = Math.max(0, Number(header.paid_sum) || 0)
+      if (oldindan >= narx) {
+        throw new HttpException(400, "Oldindan to'lov narxga teng yoki katta — bu nasiya emas, oddiy sotuv qiling")
+      }
+
+      const h = hisobla({ narx, oldindan, months: Number(nasiyaSorov.months), cfg })
+      if (!h) throw new HttpException(400, `${nasiyaSorov.months} oylik muddat sozlanmagan`)
+
+      const kutilgan = Number(nasiyaSorov.expected_debt)
+      if (kutilgan > 0 && Math.abs(kutilgan - h.jami) > 1) {
+        throw new HttpException(409,
+          "Nasiya foizlari o'zgargan — to'lov oynasini yopib, nasiyani qaytadan tanlang", {
+            code: 'NASIYA_OZGARDI', server: h.jami, kutilgan,
+          })
+      }
+
+      if (h.ustama > 0) ustamaniTaqsimla(items, h.ustama, naqdJami)
+      else items.forEach(it => { it.base_price = Number(it.price) || 0 })
+
+      const birinchi = /^\d{4}-\d{2}-\d{2}$/.test(String(nasiyaSorov.first_due || ''))
+        ? nasiyaSorov.first_due : oyQosh(bugunKey(), 1)
+
+      header.payment_type        = 'Qarz'
+      header.paid_sum            = h.oldindan
+      header.due_date            = birinchi
+      header.installment_months  = h.months
+      header.installment_percent = h.pct
+      header.installment_markup  = h.ustama
+      header.installment_base    = h.narx
+      nasiyaGrafik = grafikTuz(h.oylar, birinchi)
+    }
 
     // Calculate totals
     const totalSum  = items.reduce((s, i) => s + Number(i.total_sum), 0)
@@ -226,11 +303,14 @@ class SaleController {
     // muddat kelib qolsa (eski oynadan), uni tashlab yuboramiz.
     header.due_date = debtSum > 0 && header.due_date ? header.due_date : null
 
-    // Modelda yo'q maydonlar (faqat hisob uchun kelgan)
+    // Modelda yo'q maydonlar (faqat hisob uchun kelgan). Qiymatlari
+    // o'chirishdan OLDIN olinadi: ilgari avval o'chirilib, keyin
+    // tekshirilardi — natijada "baribir sotilsin" tasdig'i ishlamas,
+    // oldindan to'lov esa karta bilan bo'lsa ham "Naqd" yozilardi.
+    const prepayType    = header.prepay_type
+    const allowNegative = header.allow_negative === true
     delete header.prepay_type
     delete header.allow_negative
-
-    const sale = await SaleModel.create(header)
 
     const cashierName = req.currentUser?.fullname ?? req.currentUser?.username ?? null
 
@@ -252,7 +332,11 @@ class SaleController {
     // Shuning uchun yetmasa to'xtatamiz. Kassir ataylab sotmoqchi
     // bo'lsa (masalan tovar bor, lekin bazaga kirim qilinmagan)
     // `allow_negative: true` yuboradi va o'zi javobgar bo'ladi.
-    if (header.allow_negative !== true) {
+    //
+    // Tekshiruv sotuv yozuvi yaratilishidan OLDIN turishi shart — aks
+    // holda rad etilgan sotuv bazada tovarsiz "yetim" hujjat bo'lib
+    // qolardi (qarzdorlar ro'yxatida soxta qarz ko'rinardi).
+    if (!allowNegative) {
       const idlar = [...new Set(items.map(i => i.product_id).filter(Boolean))];
       if (idlar.length) {
         const mavjud = await ProductModel.findAll({
@@ -290,6 +374,8 @@ class SaleController {
       }
     }
 
+    const sale = await SaleModel.create(header)
+
     // Process items: FIFO deduction + SaleItem creation
     // fifoMap stores deductions per SaleItem id for ProductRegister
     const saleItemsFifo = []
@@ -319,6 +405,7 @@ class SaleController {
         product_name:     item.product_name || item.name || '',
         qty:              item.qty,
         price:            item.price,
+        base_price:       item.base_price ?? null,
         price_usd:        rate > 0 ? +(Number(item.price) / rate).toFixed(4) : 0,
         cost_price:       avgCost,
         total_sum:        item.total_sum,
@@ -410,12 +497,14 @@ class SaleController {
         // hisobotida to'g'ri ko'rinishi uchun o'sha usulni yozamiz.
         payment_type:   ['Naqd', 'Karta', "O'tkazma"].includes(header.payment_type)
                           ? header.payment_type
-                          : (['Naqd', 'Karta', "O'tkazma"].includes(header.prepay_type)
-                              ? header.prepay_type : 'Naqd'),
+                          : (['Naqd', 'Karta', "O'tkazma"].includes(prepayType)
+                              ? prepayType : 'Naqd'),
         reference_id:   sale.id,
         reference_type: debtSum > 0 ? 'sale_prepay' : 'sale',
         client_id:      header.client_id ?? null,
-        description:    `Sotuv #${header.doc_number}`,
+        description:    nasiyaGrafik
+          ? `Sotuv #${header.doc_number} — nasiya, oldindan to'lov`
+          : `Sotuv #${header.doc_number}`,
         cashier_id:     header.cashier_id,
         exchange_rate:  rate,
         amount_usd:     toUSD(paidSum),
@@ -430,12 +519,27 @@ class SaleController {
       }
     }
 
+    // Nasiya grafigi — har oy bitta satr. Yig'indisi debtSum ga teng
+    // (hisobla() oxirgi oyga yaxlitlash farqini beradi).
+    if (nasiyaGrafik) {
+      await SaleInstallmentModel.bulkCreate(nasiyaGrafik.map(g => ({
+        sale_id:   sale.id,
+        client_id: header.client_id,
+        no:        g.no,
+        due_date:  g.due_date,
+        amount:    g.amount,
+        paid:      0,
+      })))
+    }
+
     const result = await SaleModel.findOne({
       where:   { id: sale.id },
       include: [
         { model: ClientModel,   as: 'client' },
         { model: SaleItemModel, as: 'items'  },
+        { model: SaleInstallmentModel, as: 'installments' },
       ],
+      order: [[{ model: SaleInstallmentModel, as: 'installments' }, 'no', 'ASC']],
     })
     res.status(201).json(result)
   }
@@ -542,6 +646,7 @@ class SaleController {
 
     const jamiSumma = rejalar.reduce((a, r) => a + r.summa, 0)
     let jamiDona = 0
+    const oldingiQaytgan = new Map(sale.items.map(i => [i.id, Number(i.returned_qty) || 0]))
 
     await sequelize.transaction(async (t) => {
       for (const r of rejalar) {
@@ -599,24 +704,35 @@ class SaleController {
           { transaction: t })
       }
 
-      // 4) Pul: qarzga sotilgan bo'lsa qarzdan ayiramiz, aks holda kassadan
-      const qarzga = Number(sale.debt_sum) > 0
-      if (qarzga && sale.client_id) {
+      // 4) Pul: avval sotuvning QOLGAN qarzidan ayiramiz, ortgani
+      //    kassadan qaytariladi. Ilgari qarz to'liq to'langan bo'lsa ham
+      //    hammasi "qarzdan" ayirilib, mijoz pulini ololmay qolardi.
+      const qarzdan = sale.client_id
+        ? Math.max(0, Math.min(jamiSumma, qolgan(sale)))
+        : 0
+      const naqdQaytar = +(jamiSumma - qarzdan).toFixed(2)
+      if (qarzdan > 0) {
         const client = await ClientModel.findByPk(sale.client_id, { transaction: t })
         if (client) {
           // Qarz kamayadi — balans manfiy bo'lgani uchun ustiga qo'shamiz
-          const yangiBalans = Number(client.balance) + jamiSumma
+          const yangiBalans = Number(client.balance) + qarzdan
           await client.update({ balance: yangiBalans }, { transaction: t })
         }
         await sale.update({
-          debt_sum: Math.max(0, Number(sale.debt_sum) - jamiSumma),
+          debt_sum: Math.max(0, +(Number(sale.debt_sum) - qarzdan).toFixed(2)),
         }, { transaction: t })
-      } else {
+        // Nasiya grafigi ham kamayadi — oxirgi oylardan boshlab
+        if (Number(sale.installment_months) > 0) {
+          await grafikniKamaytir(sale.id, qarzdan, t)
+          await sale.update({ due_date: await navbatdagiSana(sale.id, t) }, { transaction: t })
+        }
+      }
+      if (naqdQaytar > 0) {
         // Naqd qaytarish — kassa harakati sifatida yoziladi
         await CashTransactionModel.create({
           date: new Date(),
           type: 'refund',
-          amount: jamiSumma,
+          amount: naqdQaytar,
           payment_type: ['Naqd', 'Karta', "O'tkazma"].includes(sale.payment_type)
             ? sale.payment_type : 'Naqd',
           reference_id: sale.id,
@@ -630,11 +746,14 @@ class SaleController {
       const yangiReturned = (Number(sale.returned_sum) || 0) + jamiSumma
       const patch = { returned_sum: yangiReturned }
 
-      // Hamma tovar qaytarilgan bo'lsa — sotuvni bekor deb belgilaymiz
+      // Hamma tovar qaytarilgan bo'lsa — sotuvni bekor deb belgilaymiz.
+      // `oldingiQaytgan` — shu qaytarishdan OLDINGI miqdor. Ilgari
+      // yangilangan `returned_qty` ustiga yana shu qaytarish qo'shilib,
+      // 2 donadan 1 tasi qaytarilsa ham sotuv to'liq bekor bo'lib qolardi.
       const qoldi = sale.items.reduce((a, i) => {
         const q = Number(i.qty) || 0
         const r = rejalar.find(x => x.satr.id === i.id)
-        const qaytdi = (Number(i.returned_qty) || 0) + (r ? r.qty : 0)
+        const qaytdi = (oldingiQaytgan.get(i.id) || 0) + (r ? r.qty : 0)
         return a + (q - qaytdi)
       }, 0)
       if (qoldi <= 0) {
@@ -717,32 +836,66 @@ class SaleController {
   }
 
   // ── Debt payment ──────────────────────────────────────────────
+  // Mijoz to'lovi sotuvlar (va nasiya oylari) orasida taqsimlanadi —
+  // eng birinchi muddati kelganidan boshlab. `sale_id` berilsa faqat shu
+  // shartnomaga yoziladi (Nasiya bo'limidan to'lov qabul qilinganda).
   payDebt = async (req, res) => {
-    const { client_id, amount, payment_type = 'Naqd', description, exchange_rate } = req.body
+    const { client_id, amount, payment_type = 'Naqd', description, exchange_rate, sale_id } = req.body
     if (!client_id || !(Number(amount) > 0)) throw new HttpException(400, "client_id va musbat amount kerak")
 
     const client = await ClientModel.findByPk(client_id)
     if (!client) throw new HttpException(404, 'Mijoz topilmadi')
 
-    const paidAmount   = Number(amount)
+    const paidAmount   = +Number(amount).toFixed(2)
     const rate         = Number(exchange_rate) || 0
     const safePayType  = ['Naqd', 'Karta', "O'tkazma"].includes(payment_type) ? payment_type : 'Naqd'
     const cashierId    = req.currentUser?.id ?? null
     const cashierName  = req.currentUser?.fullname ?? req.currentUser?.username ?? null
     const now          = new Date()
 
-    await client.update({ balance: Number(client.balance) + paidAmount })
+    let shartnoma = null
+    if (sale_id) {
+      shartnoma = await SaleModel.findByPk(sale_id)
+      if (!shartnoma || shartnoma.client_id !== Number(client_id)) {
+        throw new HttpException(404, 'Shartnoma topilmadi')
+      }
+      if (shartnoma.status === 'cancelled') throw new HttpException(400, 'Shartnoma bekor qilingan')
+      const q = qolgan(shartnoma)
+      if (paidAmount - q > 0.5) {
+        throw new HttpException(400,
+          `Bu shartnoma bo'yicha qolgan qarz ${Math.round(q).toLocaleString('ru-RU')} so'm — undan ko'p qabul qilib bo'lmaydi`)
+      }
+    }
 
-    await CashTransactionModel.create({
-      date:           now,
-      type:           'debt_payment',
-      amount:         paidAmount,
-      payment_type:   safePayType,
-      client_id,
-      description:    description || `${client.name} — qarz to'lovi`,
-      cashier_id:     cashierId,
-      exchange_rate:  rate,
-      amount_usd:     rate > 0 ? +(paidAmount / rate).toFixed(4) : 0,
+    let taqsimot = null
+    await sequelize.transaction(async (t) => {
+      await client.update({ balance: Number(client.balance) + paidAmount }, { transaction: t })
+
+      const tx = await CashTransactionModel.create({
+        date:           now,
+        type:           'debt_payment',
+        amount:         paidAmount,
+        payment_type:   safePayType,
+        client_id,
+        reference_id:   shartnoma ? shartnoma.id : null,
+        reference_type: shartnoma ? 'sale' : null,
+        description:    description
+          || (shartnoma ? `${client.name} — nasiya #${shartnoma.doc_number} to'lovi` : `${client.name} — qarz to'lovi`),
+        cashier_id:     cashierId,
+        exchange_rate:  rate,
+        amount_usd:     rate > 0 ? +(paidAmount / rate).toFixed(4) : 0,
+      }, { transaction: t })
+
+      taqsimot = await tolovniTaqsimla({
+        clientId: Number(client_id),
+        amount: paidAmount,
+        saleId: shartnoma ? shartnoma.id : null,
+        transaction: t,
+        date: now,
+        paymentType: safePayType,
+        cashierName,
+        cashTransactionId: tx.id,
+      })
     })
 
     await KassaRegisterModel.create({
@@ -766,7 +919,7 @@ class SaleController {
       total_usd:     rate > 0 ? +(paidAmount / rate).toFixed(4) : 0,
     })
 
-    res.json({ client, message: 'Qarz qayd etildi' })
+    res.json({ client, taqsimot, message: 'Qarz qayd etildi' })
   }
 
   // ── Cash entry (income / expense) ────────────────────────────
