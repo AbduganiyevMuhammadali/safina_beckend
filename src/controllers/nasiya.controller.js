@@ -5,6 +5,7 @@ const SaleItemModel        = require('../models/sale_item.model')
 const SaleInstallmentModel = require('../models/sale_installment.model')
 const SalePaymentModel     = require('../models/sale_payment.model')
 const ClientModel          = require('../models/client.model')
+const UserModel            = require('../models/user.model')
 const HttpException        = require('../utils/HttpException.utils')
 const { normalizeConfig, bugunKey } = require('../utils/nasiya.utils')
 const { normPasport, normPinfl, pasportTogri, pinflTogri } = require('../utils/pasport.utils')
@@ -368,6 +369,11 @@ class NasiyaController {
     const tolovlar = await SalePaymentModel.findAll({
       where: { sale_id: sale.id }, order: [['date', 'DESC']], raw: true,
     })
+    // Shartnomadagi "Hujjat tayyorlovchi" — sotuvni rasmiylashtirgan kassir
+    // (id 0 ham haqiqiy foydalanuvchi — "Dasturchi")
+    const kassir = sale.cashier_id !== null && sale.cashier_id !== undefined
+      ? await UserModel.findByPk(sale.cashier_id, { attributes: ['fullname', 'username'], raw: true })
+      : null
 
     res.json({
       id: sale.id,
@@ -380,6 +386,7 @@ class NasiyaController {
       narx: Number(sale.installment_base) || 0,
       chegirma: Number(sale.discount) || 0,
       oldindan: Number(sale.paid_sum) || 0,
+      kassir: kassir?.fullname || kassir?.username || '',
       client: sale.client ? mijozKorinish(sale.client) : null,
       items: (sale.items || []).map(i => ({
         name: i.product_name,

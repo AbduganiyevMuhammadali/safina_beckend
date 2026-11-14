@@ -193,14 +193,14 @@ class ProductController extends BaseController {
           src: idx,
           data: {
             ...it,
-            // Model (artikul, masalan "112") va razmer alohida narsalar.
-            // Model kiritilgan bo'lsa saqlanadi va nom boshida turadi;
-            // razmer nom oxiriga qo'shiladi, chunki har razmer alohida
-            // mahsulot bo'lib yaratiladi va ular bir-biridan shu bilan
-            // farqlanadi. Model bo'sh bo'lsa — razmer uning o'rnini oladi.
+            // Model va variant (konforka, litr, metr...) alohida narsalar.
+            // Nom tartibi frontend bilan bir xil: Umumiy nom + Brend + Model
+            // + Rang, variant esa oxirida — har variant alohida mahsulot
+            // bo'lib yaratiladi va ular bir-biridan shu bilan farqlanadi.
+            // Model bo'sh bo'lsa — variant uning o'rnini oladi (yorliqda).
             model: (it.model || '').toString().trim() || s.size,
             name: [
-              it.model, it.brand, it.general_name || it.name, it.color, s.size,
+              it.general_name || it.name, it.brand, it.model, it.color, s.size,
             ].map(v => (v || '').toString().trim()).filter(Boolean).join(' '),
           },
           qty: Number(s.qty) || 0,

@@ -42,6 +42,13 @@ const DEFAULT_CONFIG = {
   passportRequired: true,
   // Narx kartochkasi uslubi: 'zamonaviy' (yangi) yoki 'klassik' (Excel kabi)
   cardStyle: 'zamonaviy',
+  // Shartnoma (A4) uchun: sotuvchi, uning telefoni va to'lov kartasi,
+  // tovar yetkazib beruvchi va kechiktirilgan kun uchun penya (%)
+  sellerName: '',
+  sellerPhone: '',
+  sellerCard: '',
+  deliverer: '',
+  penya: 0,
 }
 
 function matn(v, def, max) {
@@ -88,6 +95,11 @@ function normalizeConfig(raw) {
     script:       r.script === 'lotin' ? 'lotin' : 'kirill',
     passportRequired: r.passportRequired === undefined ? true : !!r.passportRequired,
     cardStyle: r.cardStyle === 'klassik' ? 'klassik' : 'zamonaviy',
+    sellerName:  matn(r.sellerName, '', 80),
+    sellerPhone: matn(r.sellerPhone, '', 40),
+    sellerCard:  matn(r.sellerCard, '', 40),
+    deliverer:   matn(r.deliverer, '', 80),
+    penya:       Math.min(5, Math.max(0, Math.round(son(r.penya) * 100) / 100)),
   }
 }
 
