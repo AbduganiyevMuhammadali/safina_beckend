@@ -1,0 +1,1032 @@
+const { Op, fn, col, literal } = require('sequelize')
+const sequelize              = require('../db/db-sequelize')
+const ProductRegisterModel   = require('../models/product_register.model')
+const KassaRegisterModel     = require('../models/kassa_register.model')
+const SaleModel              = require('../models/sale.model')
+const SaleItemModel          = require('../models/sale_item.model')
+const ClientModel            = require('../models/client.model')
+const ProductModel           = require('../models/product.model')
+const SupplierModel          = require('../models/supplier.model')
+const PurchaseModel          = require('../models/purchase.model')
+const CashTransactionModel   = require('../models/cash_transaction.model')
+const { dateRange, dayRange: dayRangeUtil } = require('../utils/dateRange.utils')
+
+// Kun chegaralari mahalliy vaqtda hisoblanadi — dateRange.utils.js ga qarang
+function dayRange(dateStr) {
+  return dayRangeUtil(Op, dateStr || new Date())
+}
+
+function range(from, to) {
+  return dateRange(Op, from, to) || {}
+}
+
+class ReportController {
+
+  // ── Overview ─── today / week / month summary ─────────────────
+  getOverview = async (req, res) => {
+    const now   = new Date()
+    const today = new Date(now); today.setHours(0, 0, 0, 0)
+    const weekAgo  = new Date(now); weekAgo.setDate(now.getDate() - 6); weekAgo.setHours(0,0,0,0)
+    const monthAgo = new Date(now); monthAgo.setDate(1); monthAgo.setHours(0,0,0,0)
+
+    async function stats(dateWhere) {
+      // Faqat haqiqiy savdolar (sale_id mavjud)
+      const [saleRows, debtRows] = await Promise.all([
+        KassaRegisterModel.findAll({
+          where: { status: 'completed', date: dateWhere, sale_id: { [Op.not]: null } },
+          attributes: [
+            [fn('COUNT', col('id')),          'sales_count'],
+            // Tushum — chegirmadan KEYINGI summa. `total_sum` tovarlarning
+            // yozilgan narxi bo'lgani uchun chegirmani ayiramiz, aks holda
+            // hisobotda haqiqatda olinmagan pul ko'rinardi.
+            [fn('SUM', literal('total_sum - COALESCE(discount, 0)')), 'revenue'],
+            [fn('SUM',   col('paid_sum')),    'paid'],
+            [fn('SUM',   col('debt_sum')),    'debt'],
+            [fn('SUM',   col('item_count')),  'items'],
+          ],
+          raw: true,
+        }),
+        // Qarz to'lovlari (sale_id null — payDebt orqali tushganlar)
+        KassaRegisterModel.findAll({
+          where: { status: 'completed', date: dateWhere, sale_id: null },
+          attributes: [[fn('SUM', col('paid_sum')), 'total']],
+          raw: true,
+        }),
+      ])
+      const r             = saleRows[0] || {}
+      const debt_payments = Number(debtRows[0]?.total) || 0
+      const sale_paid     = Number(r.paid) || 0
+      return {
+        sales_count:   Number(r.sales_count) || 0,
+        revenue:       Number(r.revenue)     || 0,
+        paid:          sale_paid,
+        debt:          Number(r.debt)        || 0,
+        items:         Number(r.items)       || 0,
+        debt_payments,                           // bugun qabul qilingan qarz to'lovlari
+        income:        sale_paid + debt_payments, // kassaga kirgan jami pul
+      }
+    }
+
+    const [today_stats, week_stats, month_stats] = await Promise.all([
+      stats({ [Op.gte]: today }),
+      stats({ [Op.gte]: weekAgo }),
+      stats({ [Op.gte]: monthAgo }),
+    ])
+
+    // Bugungi sotuvlar soat bo'yicha. Sanalar bazada lokal vaqtda
+    // saqlanadi (ulanish `timezone: '+05:00'` bilan ochiladi), shuning
+    // uchun HOUR() to'g'ridan-to'g'ri lokal soatni beradi.
+    const hourly = await KassaRegisterModel.findAll({
+      where: { status: 'completed', date: { [Op.gte]: today } },
+      attributes: [
+        [fn('HOUR', col('date')), 'hour'],
+        // Chegirmadan keyingi haqiqiy tushum
+        [fn('SUM', literal('total_sum - COALESCE(discount, 0)')), 'revenue'],
+        [fn('COUNT', col('id')), 'count'],
+      ],
+      group: [fn('HOUR', col('date'))],
+      order: [[fn('HOUR', col('date')), 'ASC']],
+      raw: true,
+    })
+
+    res.json({ today: today_stats, week: week_stats, month: month_stats, hourly })
+  }
+
+  // ── Today's sales list ────────────────────────────────────────
+  getTodaySales = async (req, res) => {
+    // Kun chegarasi mahalliy vaqtda — dateRange.utils.js ga qarang
+    const { date } = req.query
+
+    const sales = await SaleModel.findAll({
+      where:   { status: 'completed', date: dayRange(date) },
+      order:   [['date', 'DESC']],
+      include: [
+        { model: ClientModel,   as: 'client',  attributes: ['id', 'name'], required: false },
+        { model: SaleItemModel, as: 'items',   attributes: ['id', 'product_name', 'qty', 'price', 'total_sum'] },
+      ],
+    })
+
+    // `total_sum` — chegirmadan OLDINGI summa (tovarlarning yozilgan narxi).
+    // Hisobotda esa haqiqiy savdo kerak, shuning uchun chegirmani ayirib
+    // `net_sum` qo'shamiz. `total_sum` o'zi ham qoladi — eski
+    // chaqiruvchilar buzilmasin.
+    res.json(sales.map(s => {
+      const j = s.toJSON()
+      j.net_sum = +(Number(j.total_sum || 0) - Number(j.discount || 0)).toFixed(2)
+      return j
+    }))
+  }
+
+  // ── Product sales report ──────────────────────────────────────
+  /**
+   * GET /api/v1/reports/ombor
+   *
+   * OMBOR QOLDIG'I — "qaysi tovar bor va nechtasi bor".
+   *
+   * Har tovar bo'yicha: qoldiq, tannarx, sotuv narxi, ombordagi
+   * qiymati va kutilayotgan foyda. Qo'shimcha — oxirgi 30 kunda
+   * qancha sotilgani (sotuv tezligi) va necha kunga yetishi.
+   *
+   * Parametrlar:
+   *   search    — nom yoki shtrix-kod
+   *   category  — kategoriya
+   *   holat     — 'bor' | 'tugagan' | 'kam' | 'manfiy' | 'all'
+   *   sort      — 'nom' | 'qoldiq' | 'qiymat' | 'sotuv'
+   *   page, limit
+   */
+  getOmborReport = async (req, res) => {
+    const {
+      search, category, holat = 'bor', sort = 'nom',
+      page = 1, limit = 100,
+    } = req.query
+
+    const where = { is_folder: false, active: true }
+
+    if (holat === 'bor')      where.qty = { [Op.gt]: 0 }
+    else if (holat === 'tugagan') where.qty = { [Op.lte]: 0 }
+    else if (holat === 'manfiy')  where.qty = { [Op.lt]: 0 }
+    // 'kam' quyida literal bilan (min_qty bilan solishtirish)
+    // 'all' — filtr yo'q
+
+    if (category && category !== 'all') where.category = category
+
+    if (search) {
+      const q = String(search).trim()
+      where[Op.or] = [
+        { name:     { [Op.like]: `%${q}%` } },
+        { code:     { [Op.like]: `%${q}%` } },
+        { barcodes: { [Op.like]: `%${q}%` } },
+      ]
+    }
+
+    if (holat === 'kam') {
+      where[Op.and] = [
+        literal('`ProductModel`.`qty` > 0'),
+        literal('`ProductModel`.`qty` <= `ProductModel`.`min_qty`'),
+      ]
+    }
+
+    // ── Umumiy statistika (filtrga bog'liq emas — butun ombor) ────
+    const [umumiy] = await sequelize.query(`
+      SELECT
+        COUNT(*) xil,
+        COALESCE(SUM(CASE WHEN qty > 0 THEN qty ELSE 0 END), 0) dona,
+        COALESCE(SUM(CASE WHEN qty > 0 THEN 1 ELSE 0 END), 0) bor,
+        COALESCE(SUM(CASE WHEN qty <= 0 THEN 1 ELSE 0 END), 0) tugagan,
+        COALESCE(SUM(CASE WHEN qty > 0 AND qty <= min_qty THEN 1 ELSE 0 END), 0) kam,
+        COALESCE(SUM(CASE WHEN qty < 0 THEN 1 ELSE 0 END), 0) manfiy
+      FROM \`product\`
+      WHERE is_folder = 0 AND active = 1`,
+      { type: sequelize.QueryTypes.SELECT })
+
+    // Ombor qiymati — FIFO partiyalari bo'yicha (haqiqiy tannarx).
+    // `purchase_item.stock_qty` × `cost_price` — bu omborda turgan
+    // pulning aniq miqdori.
+    const [qiymat] = await sequelize.query(`
+      SELECT
+        COALESCE(SUM(pi.stock_qty * pi.cost_price), 0) tannarx_qiymati,
+        COALESCE(SUM(pi.stock_qty), 0) partiya_dona
+      FROM \`purchase_item\` pi
+      JOIN \`product\` p ON p.id = pi.product_id
+      WHERE pi.stock_qty > 0 AND p.is_folder = 0 AND p.active = 1`,
+      { type: sequelize.QueryTypes.SELECT })
+
+    // Sotuv narxidagi qiymat — sotilsa qancha pul tushishi
+    const [sotuvQiymat] = await sequelize.query(`
+      SELECT COALESCE(SUM(qty * retail_price), 0) sotuv_qiymati
+      FROM \`product\`
+      WHERE is_folder = 0 AND active = 1 AND qty > 0`,
+      { type: sequelize.QueryTypes.SELECT })
+
+    // ── Ro'yxat ──────────────────────────────────────────────────
+    const offset = (Number(page) - 1) * Number(limit)
+
+    const { count, rows } = await ProductModel.findAndCountAll({
+      where,
+      attributes: [
+        'id', 'code', 'name', 'category', 'qty', 'min_qty', 'unit',
+        'retail_price', 'wholesale_price', 'barcodes',
+      ],
+      order: sort === 'qoldiq'  ? [['qty', 'DESC']]
+           : sort === 'qiymat'  ? [[literal('`qty` * `retail_price`'), 'DESC']]
+           : [['name', 'ASC']],
+      limit:  Number(limit),
+      offset,
+    })
+
+    const ids = rows.map(p => p.id)
+
+    // Tannarx — FIFO partiyalaridan (o'rtacha vaznli)
+    let tannarxMap = new Map()
+    if (ids.length) {
+      const t = await sequelize.query(`
+        SELECT product_id,
+               SUM(stock_qty * cost_price) / NULLIF(SUM(stock_qty), 0) tannarx,
+               SUM(stock_qty) partiya_qoldiq
+        FROM \`purchase_item\`
+        WHERE product_id IN (:ids) AND stock_qty > 0
+        GROUP BY product_id`,
+        { replacements: { ids }, type: sequelize.QueryTypes.SELECT })
+      tannarxMap = new Map(t.map(r => [r.product_id, r]))
+    }
+
+    // Oxirgi 30 kunda sotilgani — sotuv tezligi.
+    // Shundan "necha kunga yetadi" hisoblanadi: sekin sotiladigan
+    // tovarga pul bog'lanib qolgani ko'rinadi.
+    let sotuvMap = new Map()
+    if (ids.length) {
+      const chegara = new Date()
+      chegara.setDate(chegara.getDate() - 30)
+      const sv = await sequelize.query(`
+        SELECT si.product_id, SUM(si.qty) sotildi, COUNT(DISTINCT s.id) marta
+        FROM \`sale_item\` si
+        JOIN \`sale\` s ON s.id = si.sale_id
+          AND (s.status IS NULL OR s.status <> 'cancelled')
+          AND s.date >= :chegara
+        WHERE si.product_id IN (:ids)
+        GROUP BY si.product_id`,
+        { replacements: { ids, chegara }, type: sequelize.QueryTypes.SELECT })
+      sotuvMap = new Map(sv.map(r => [r.product_id, r]))
+    }
+
+    const data = rows.map(p => {
+      const qty     = Number(p.qty) || 0
+      const t       = tannarxMap.get(p.id)
+      const tannarx = Number(t?.tannarx) || 0
+      const narx    = Number(p.retail_price) || 0
+      const sv      = sotuvMap.get(p.id)
+      const sotildi = Number(sv?.sotildi) || 0
+
+      // Kunlik o'rtacha sotuv → necha kunga yetadi
+      const kunlik = sotildi / 30
+      const yetadi = kunlik > 0 ? Math.round(qty / kunlik) : null
+
+      let barcode = null
+      try { barcode = (JSON.parse(p.barcodes) || [])[0] || null } catch { /* buzuq */ }
+
+      return {
+        id:        p.id,
+        code:      p.code,
+        nomi:      p.name,
+        kategoriya: p.category,
+        barcode,
+        birlik:    p.unit || 'Dona',
+        qoldiq:    qty,
+        min_qty:   Number(p.min_qty) || 0,
+        tannarx,
+        narx,
+        // Ombordagi qiymati — tannarx va sotuv narxida
+        tannarx_qiymati: +(tannarx * qty).toFixed(2),
+        sotuv_qiymati:   +(narx * qty).toFixed(2),
+        // Sotilsa qancha foyda kutiladi
+        kutilgan_foyda:  +((narx - tannarx) * qty).toFixed(2),
+        // Oxirgi 30 kun
+        sotildi_30k: sotildi,
+        marta_30k:   Number(sv?.marta) || 0,
+        yetadi_kun:  yetadi,
+        // Partiya nomuvofiqligi — FIFO buzilgan bo'lsa ko'rinadi
+        partiya_qoldiq: t ? Number(t.partiya_qoldiq) : 0,
+        kam: qty > 0 && qty <= (Number(p.min_qty) || 0),
+      }
+    })
+
+    // Kategoriyalar ro'yxati — filtr uchun
+    const kategoriyalar = await sequelize.query(`
+      SELECT category nomi, COUNT(*) xil, COALESCE(SUM(qty), 0) dona
+      FROM \`product\`
+      WHERE is_folder = 0 AND active = 1 AND qty > 0
+        AND category IS NOT NULL AND category <> ''
+      GROUP BY category ORDER BY dona DESC`,
+      { type: sequelize.QueryTypes.SELECT })
+
+    res.json({
+      total: count,
+      page:  Number(page),
+      has_more: offset + rows.length < count,
+      umumiy: {
+        xil:     Number(umumiy.xil)     || 0,
+        dona:    Number(umumiy.dona)    || 0,
+        bor:     Number(umumiy.bor)     || 0,
+        tugagan: Number(umumiy.tugagan) || 0,
+        kam:     Number(umumiy.kam)     || 0,
+        manfiy:  Number(umumiy.manfiy)  || 0,
+        tannarx_qiymati: Number(qiymat.tannarx_qiymati) || 0,
+        sotuv_qiymati:   Number(sotuvQiymat.sotuv_qiymati) || 0,
+      },
+      kategoriyalar,
+      data,
+    })
+  }
+
+  getProductSales = async (req, res) => {
+    const { date_from, date_to } = req.query
+    const where = { status: 'active' }
+    if (date_from || date_to) where.date = range(date_from, date_to)
+
+    const rows = await ProductRegisterModel.findAll({
+      where,
+      attributes: [
+        'product_id',
+        'product_name',
+        'warehouse',
+        [fn('SUM',   col('qty')),       'total_qty'],
+        [fn('SUM',   col('total_sum')), 'total_sum'],
+        [fn('COUNT', col('id')),        'sales_count'],
+        [fn('AVG',   col('price')),     'avg_price'],
+      ],
+      group:  ['product_id', 'product_name', 'warehouse'],
+      order:  [[fn('SUM', col('total_sum')), 'DESC']],
+      raw: true,
+    })
+
+    const result = rows.map(r => ({
+      product_id:  r.product_id,
+      product_name: r.product_name,
+      warehouse:   r.warehouse,
+      total_qty:   Number(r.total_qty)   || 0,
+      total_sum:   Number(r.total_sum)   || 0,
+      sales_count: Number(r.sales_count) || 0,
+      avg_price:   Math.round(Number(r.avg_price) || 0),
+    }))
+
+    res.json(result)
+  }
+
+  // ── Client report ─────────────────────────────────────────────
+  getClientReport = async (req, res) => {
+    const { date_from, date_to } = req.query
+    const where = { status: 'completed' }
+    if (date_from || date_to) where.date = range(date_from, date_to)
+
+    // Sales per client from kassa_register
+    const rows = await KassaRegisterModel.findAll({
+      where,
+      attributes: [
+        'client_id',
+        'client_name',
+        [fn('COUNT', col('id')),          'sales_count'],
+        // Chegirmadan keyingi haqiqiy savdo
+        [fn('SUM', literal('total_sum - COALESCE(discount, 0)')), 'total_sum'],
+        [fn('SUM',   col('paid_sum')),    'paid_sum'],
+        [fn('SUM',   col('debt_sum')),    'debt_sum'],
+      ],
+      group:  ['client_id', 'client_name'],
+      order:  [[fn('SUM', literal('total_sum - COALESCE(discount, 0)')), 'DESC']],
+      raw: true,
+    })
+
+    // Current balances from client table
+    const clientIds = rows.filter(r => r.client_id).map(r => r.client_id)
+    let balanceMap = {}
+    if (clientIds.length) {
+      const clients = await ClientModel.findAll({
+        where: { id: { [Op.in]: clientIds } },
+        attributes: ['id', 'balance', 'phone', 'code'],
+        raw: true,
+      })
+      clients.forEach(c => { balanceMap[c.id] = c })
+    }
+
+    const result = rows.map(r => {
+      const cli = balanceMap[r.client_id] || {}
+      return {
+        client_id:   r.client_id,
+        client_name: r.client_name || '— Noma\'lum —',
+        client_code: cli.code  || '',
+        phone:       cli.phone || '',
+        sales_count: Number(r.sales_count) || 0,
+        total_sum:   Number(r.total_sum)   || 0,
+        paid_sum:    Number(r.paid_sum)    || 0,
+        debt_sum:    Number(r.debt_sum)    || 0,
+        balance:     Number(cli.balance)   || 0,
+      }
+    })
+
+    res.json(result)
+  }
+
+  // ── Cashier report ────────────────────────────────────────────
+  getCashierReport = async (req, res) => {
+    const { date_from, date_to } = req.query
+    const where = { status: 'completed' }
+    if (date_from || date_to) where.date = range(date_from, date_to)
+
+    const rows = await KassaRegisterModel.findAll({
+      where,
+      attributes: [
+        'cashier_id',
+        'cashier_name',
+        [fn('COUNT', col('id')),          'sales_count'],
+        // Chegirmadan keyingi haqiqiy savdo
+        [fn('SUM', literal('total_sum - COALESCE(discount, 0)')), 'total_sum'],
+        [fn('SUM',   col('paid_sum')),    'paid_sum'],
+        [fn('SUM',   col('debt_sum')),    'debt_sum'],
+        [fn('SUM',   col('item_count')),  'items_sold'],
+        [fn('SUM',   col('discount')),    'total_discount'],
+      ],
+      group:  ['cashier_id', 'cashier_name'],
+      order:  [[fn('SUM', literal('total_sum - COALESCE(discount, 0)')), 'DESC']],
+      raw: true,
+    })
+
+    const result = rows.map(r => ({
+      cashier_id:      r.cashier_id,
+      cashier_name:    r.cashier_name || 'Noma\'lum',
+      sales_count:     Number(r.sales_count)     || 0,
+      total_sum:       Number(r.total_sum)       || 0,
+      paid_sum:        Number(r.paid_sum)        || 0,
+      debt_sum:        Number(r.debt_sum)        || 0,
+      items_sold:      Number(r.items_sold)      || 0,
+      total_discount:  Number(r.total_discount)  || 0,
+    }))
+
+    res.json(result)
+  }
+
+  // ── Profit report ─────────────────────────────────────────────
+  getProfitReport = async (req, res) => {
+    const { date_from, date_to, group_by = 'product' } = req.query
+    const where = { status: 'active' }
+    if (date_from || date_to) where.date = range(date_from, date_to)
+
+    const totals = await ProductRegisterModel.findAll({
+      where,
+      attributes: [
+        [fn('SUM', col('total_sum')),            'revenue'],
+        [fn('SUM', literal('cost_price * qty')), 'cost'],
+        [fn('SUM', col('qty')),                  'total_qty'],
+      ],
+      raw: true,
+    })
+    const t       = totals[0] || {}
+    const revenue = Number(t.revenue) || 0
+    const cost    = Number(t.cost)    || 0
+    const summary = {
+      revenue,
+      cost,
+      profit:     revenue - cost,
+      profit_pct: revenue > 0 ? +((revenue - cost) / revenue * 100).toFixed(1) : 0,
+      total_qty:  Number(t.total_qty) || 0,
+    }
+
+    let rows = []
+    if (group_by === 'date') {
+      const raw = await ProductRegisterModel.findAll({
+        where,
+        attributes: [
+          [fn('DATE', col('date')),                'day'],
+          [fn('SUM', col('total_sum')),            'revenue'],
+          [fn('SUM', literal('cost_price * qty')), 'cost'],
+          [fn('SUM', col('qty')),                  'total_qty'],
+          [fn('COUNT', col('id')),                 'sales_count'],
+        ],
+        group:  [fn('DATE', col('date'))],
+        order:  [[fn('DATE', col('date')), 'ASC']],
+        raw: true,
+      })
+      rows = raw.map(r => {
+        const rev = Number(r.revenue) || 0
+        const cst = Number(r.cost)    || 0
+        return {
+          day:         r.day,
+          revenue:     rev,
+          cost:        cst,
+          profit:      rev - cst,
+          profit_pct:  rev > 0 ? +((rev - cst) / rev * 100).toFixed(1) : 0,
+          total_qty:   Number(r.total_qty)   || 0,
+          sales_count: Number(r.sales_count) || 0,
+        }
+      })
+    } else {
+      const raw = await ProductRegisterModel.findAll({
+        where,
+        attributes: [
+          'product_id',
+          'product_name',
+          [fn('SUM', col('total_sum')),            'revenue'],
+          [fn('SUM', literal('cost_price * qty')), 'cost'],
+          [fn('SUM', col('qty')),                  'total_qty'],
+          [fn('COUNT', col('id')),                 'sales_count'],
+          [fn('AVG',  col('price')),               'avg_price'],
+          [fn('AVG',  col('cost_price')),          'avg_cost'],
+        ],
+        group:  ['product_id', 'product_name'],
+        order:  [[fn('SUM', col('total_sum')), 'DESC']],
+        raw: true,
+      })
+      rows = raw.map(r => {
+        const rev = Number(r.revenue) || 0
+        const cst = Number(r.cost)    || 0
+        return {
+          product_id:   r.product_id,
+          product_name: r.product_name,
+          revenue:      rev,
+          cost:         cst,
+          profit:       rev - cst,
+          profit_pct:   rev > 0 ? +((rev - cst) / rev * 100).toFixed(1) : 0,
+          total_qty:    Number(r.total_qty)   || 0,
+          sales_count:  Number(r.sales_count) || 0,
+          avg_price:    Math.round(Number(r.avg_price) || 0),
+          avg_cost:     Math.round(Number(r.avg_cost)  || 0),
+        }
+      })
+    }
+
+    res.json({ summary, rows, group_by })
+  }
+
+  // ── Dashboard extra: low-stock, expenses, client debts, supplier debts, period chart ──
+  getDashboardExtra = async (req, res) => {
+    const { period = 'day' } = req.query
+    const now = new Date()
+
+    // Low-stock products (qty <= min_qty, min_qty > 0)
+    const lowStock = await ProductModel.findAll({
+      where: {
+        active: true,
+        is_folder: false,
+        min_qty: { [Op.gt]: 0 },
+        [Op.and]: literal('`ProductModel`.`qty` <= `ProductModel`.`min_qty`'),
+      },
+      attributes: ['id', 'code', 'name', 'unit', 'qty', 'min_qty'],
+      order: [['qty', 'ASC']],
+      limit: 20,
+      raw: true,
+    })
+
+    // Today's supplier payment expenses
+    const todayStart = new Date(now); todayStart.setHours(0, 0, 0, 0)
+    const todayEnd   = new Date(now); todayEnd.setHours(23, 59, 59, 999)
+    const todayExpenses = await CashTransactionModel.findAll({
+      where: {
+        type: 'expense',
+        reference_type: 'supplier_payment',
+        date: { [Op.between]: [todayStart, todayEnd] },
+      },
+      attributes: ['id', 'date', 'amount', 'payment_type', 'description', 'reference_id'],
+      order: [['date', 'DESC']],
+      raw: true,
+    })
+    // Attach supplier names
+    const supIds = [...new Set(todayExpenses.map(e => e.reference_id).filter(Boolean))]
+    let supNameMap = {}
+    if (supIds.length) {
+      const sups = await SupplierModel.findAll({ where: { id: { [Op.in]: supIds } }, attributes: ['id', 'name'], raw: true })
+      sups.forEach(s => { supNameMap[s.id] = s.name })
+    }
+    const expenses = todayExpenses.map(e => ({
+      ...e,
+      supplier_name: supNameMap[e.reference_id] || e.description || '',
+    }))
+    const totalExpenses = expenses.reduce((s, e) => s + Number(e.amount), 0)
+
+    // Client debts (balance < 0)
+    const debtClients = await ClientModel.findAll({
+      where: { balance: { [Op.lt]: 0 }, active: true },
+      attributes: ['id', 'name', 'phone', 'code', 'balance'],
+      order: [['balance', 'ASC']],
+      limit: 10,
+      raw: true,
+    })
+
+    // Supplier debts (balance < 0 = we owe them)
+    const debtSuppliers = await SupplierModel.findAll({
+      where: { balance: { [Op.lt]: 0 }, active: true },
+      attributes: ['id', 'name', 'phone', 'code', 'balance'],
+      order: [['balance', 'ASC']],
+      limit: 10,
+      raw: true,
+    })
+
+    // Sanalar bazaga ALLAQACHON lokal vaqtda yoziladi: Sequelize
+    // ulanishida `timezone: '+05:00'` berilgan va MySQL sessiyasi shu
+    // zonada ochiladi. Shuning uchun HOUR()/DATE() ni to'g'ridan-to'g'ri
+    // qo'llaymiz.
+    //
+    // Ilgari bu yerda `CONVERT_TZ(date, '+00:00', '+05:00')` bor edi —
+    // u sanani UTC deb hisoblab yana +5 soat qo'shardi va grafikda
+    // sotuvlar 5 soat keyinroq (masalan 16:25 -> 21:25) ko'rinardi.
+
+    // Period-based chart: revenue & profit per unit
+    let chartLabels = [], chartRevenue = [], chartCost = [], chartProfit = []
+    if (period === 'day') {
+      // Bugungi soatlar bo'yicha (lokal vaqt)
+      const raw = await ProductRegisterModel.findAll({
+        where: { status: 'active', date: { [Op.between]: [todayStart, todayEnd] } },
+        attributes: [
+          [fn('HOUR', col('date')), 'unit'],
+          [fn('SUM', col('total_sum')), 'revenue'],
+          [fn('SUM', literal('cost_price * qty')), 'cost'],
+        ],
+        group: [fn('HOUR', col('date'))],
+        order: [[fn('HOUR', col('date')), 'ASC']],
+        raw: true,
+      })
+      const map = {}
+      raw.forEach(r => { map[Number(r.unit)] = r })
+      for (let h = 0; h < 24; h++) {
+        chartLabels.push(`${String(h).padStart(2,'0')}:00`)
+        const rev = Number(map[h]?.revenue) || 0
+        const cst = Number(map[h]?.cost)    || 0
+        chartRevenue.push(rev)
+        chartCost.push(cst)
+        chartProfit.push(rev - cst)
+      }
+    } else if (period === 'week') {
+      const weekAgo = new Date(now); weekAgo.setDate(now.getDate() - 6); weekAgo.setHours(0,0,0,0)
+      const raw = await ProductRegisterModel.findAll({
+        where: { status: 'active', date: { [Op.between]: [weekAgo, todayEnd] } },
+        attributes: [
+          [fn('DATE', col('date')), 'unit'],
+          [fn('SUM', col('total_sum')), 'revenue'],
+          [fn('SUM', literal('cost_price * qty')), 'cost'],
+        ],
+        group: [fn('DATE', col('date'))],
+        order: [[fn('DATE', col('date')), 'ASC']],
+        raw: true,
+      })
+      const map = {}
+      raw.forEach(r => { map[r.unit] = r })
+      const DAY_NAMES = ['Yak','Dush','Sesh','Chor','Pay','Jum','Shan']
+      for (let i = 6; i >= 0; i--) {
+        const d = new Date(now); d.setDate(now.getDate() - i)
+        // Lokal sana string (YYYY-MM-DD)
+        const key = `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`
+        chartLabels.push(DAY_NAMES[d.getDay()])
+        const rev = Number(map[key]?.revenue) || 0
+        const cst = Number(map[key]?.cost)    || 0
+        chartRevenue.push(rev)
+        chartCost.push(cst)
+        chartProfit.push(rev - cst)
+      }
+    } else if (period === 'month') {
+      const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+      const raw = await ProductRegisterModel.findAll({
+        where: { status: 'active', date: { [Op.between]: [monthStart, todayEnd] } },
+        attributes: [
+          [fn('DATE', col('date')), 'unit'],
+          [fn('SUM', col('total_sum')), 'revenue'],
+          [fn('SUM', literal('cost_price * qty')), 'cost'],
+        ],
+        group: [fn('DATE', col('date'))],
+        order: [[fn('DATE', col('date')), 'ASC']],
+        raw: true,
+      })
+      raw.forEach(r => {
+        chartLabels.push(r.unit?.slice(8,10) + '-kun')
+        const rev = Number(r.revenue) || 0
+        const cst = Number(r.cost)    || 0
+        chartRevenue.push(rev)
+        chartCost.push(cst)
+        chartProfit.push(rev - cst)
+      })
+    } else if (period === 'year') {
+      const yearStart = new Date(now.getFullYear(), 0, 1)
+      const MONTH_NAMES = ['Yan','Fev','Mar','Apr','May','Iyn','Iyl','Avg','Sen','Okt','Noy','Dek']
+      const raw = await ProductRegisterModel.findAll({
+        where: { status: 'active', date: { [Op.between]: [yearStart, todayEnd] } },
+        attributes: [
+          [fn('MONTH', col('date')), 'unit'],
+          [fn('SUM', col('total_sum')), 'revenue'],
+          [fn('SUM', literal('cost_price * qty')), 'cost'],
+        ],
+        group: [fn('MONTH', col('date'))],
+        order: [[fn('MONTH', col('date')), 'ASC']],
+        raw: true,
+      })
+      const map = {}
+      raw.forEach(r => { map[Number(r.unit)] = r })
+      for (let m = 1; m <= 12; m++) {
+        chartLabels.push(MONTH_NAMES[m-1])
+        const rev = Number(map[m]?.revenue) || 0
+        const cst = Number(map[m]?.cost)    || 0
+        chartRevenue.push(rev)
+        chartCost.push(cst)
+        chartProfit.push(rev - cst)
+      }
+    }
+
+    // Top-7 tovarlar (bugun sotilganlar bo'yicha)
+    const topProducts = await ProductRegisterModel.findAll({
+      where: { status: 'active', date: { [Op.between]: [todayStart, todayEnd] } },
+      attributes: [
+        'product_name',
+        [fn('SUM', col('total_sum')), 'revenue'],
+        [fn('SUM', col('qty')),       'qty'],
+        [fn('SUM', literal('cost_price * qty')), 'cost'],
+      ],
+      group: ['product_name'],
+      order: [[fn('SUM', col('total_sum')), 'DESC']],
+      limit: 7,
+      raw: true,
+    })
+
+    // To'lov turlari taqsimoti (bugun, kassa_register)
+    const payRows = await KassaRegisterModel.findAll({
+      where: { status: 'completed', date: { [Op.between]: [todayStart, todayEnd] }, sale_id: { [Op.not]: null } },
+      attributes: [
+        'payment_type',
+        [fn('SUM', col('paid_sum')), 'total'],
+        [fn('COUNT', col('id')),    'count'],
+      ],
+      group: ['payment_type'],
+      raw: true,
+    })
+
+    // ── Qo'shimcha analitika bloklari ─────────────────────────────
+    const monthStart = new Date(now.getFullYear(), now.getMonth(), 1)
+    const yesterdayStart = new Date(todayStart); yesterdayStart.setDate(yesterdayStart.getDate() - 1)
+    const yesterdayEnd   = new Date(todayStart); yesterdayEnd.setMilliseconds(-1)
+
+    // 1) O'rtacha chek (AOV) — bugun vs kecha
+    const aovWhere = { status: 'completed', sale_id: { [Op.not]: null } }
+    const [aovToday, aovYesterday] = await Promise.all([
+      KassaRegisterModel.findAll({
+        where: { ...aovWhere, date: { [Op.between]: [todayStart, todayEnd] } },
+        attributes: [[fn('SUM', col('total_sum')), 'revenue'], [fn('COUNT', col('id')), 'cnt']],
+        raw: true,
+      }),
+      KassaRegisterModel.findAll({
+        where: { ...aovWhere, date: { [Op.between]: [yesterdayStart, yesterdayEnd] } },
+        attributes: [[fn('SUM', col('total_sum')), 'revenue'], [fn('COUNT', col('id')), 'cnt']],
+        raw: true,
+      }),
+    ])
+    const tCnt = Number(aovToday[0]?.cnt) || 0
+    const yCnt = Number(aovYesterday[0]?.cnt) || 0
+    const aovTodayVal = tCnt > 0 ? (Number(aovToday[0]?.revenue) || 0) / tCnt : 0
+    const aovYestVal  = yCnt > 0 ? (Number(aovYesterday[0]?.revenue) || 0) / yCnt : 0
+    const averageOrderValue = {
+      amount: Math.round(aovTodayVal),
+      trend:  aovYestVal > 0 ? +(((aovTodayVal - aovYestVal) / aovYestVal) * 100).toFixed(1) : 0,
+    }
+
+    // 2) Sof foyda — yalpi foyda (product_register) minus xarajatlar (cash_transaction)
+    async function grossProfit(fromDate) {
+      const rows = await ProductRegisterModel.findAll({
+        where: { status: 'active', date: { [Op.between]: [fromDate, todayEnd] } },
+        attributes: [
+          [fn('SUM', col('total_sum')),            'revenue'],
+          [fn('SUM', literal('cost_price * qty')), 'cost'],
+        ],
+        raw: true,
+      })
+      const rev = Number(rows[0]?.revenue) || 0
+      return { revenue: rev, profit: rev - (Number(rows[0]?.cost) || 0) }
+    }
+    async function expensesSum(fromDate) {
+      const s = await CashTransactionModel.sum('amount', {
+        where: { type: 'expense', date: { [Op.between]: [fromDate, todayEnd] } },
+      })
+      return Number(s) || 0
+    }
+    const [gpToday, gpMonth, expToday, expMonth] = await Promise.all([
+      grossProfit(todayStart), grossProfit(monthStart),
+      expensesSum(todayStart), expensesSum(monthStart),
+    ])
+    const netMonthProfit = gpMonth.profit - expMonth
+    const netProfit = {
+      today:            Math.round(gpToday.profit - expToday),
+      month:            Math.round(netMonthProfit),
+      marginPercentage: gpMonth.revenue > 0 ? +((netMonthProfit / gpMonth.revenue) * 100).toFixed(1) : 0,
+    }
+
+    // 3) Qaytarishlar tahlili (shu oy) — bekor qilingan savdolar
+    const [returnRows, topReturnedRaw] = await Promise.all([
+      KassaRegisterModel.findAll({
+        where: { status: 'cancelled', sale_id: { [Op.not]: null }, date: { [Op.between]: [monthStart, todayEnd] } },
+        attributes: [[fn('SUM', col('total_sum')), 'total'], [fn('COUNT', col('id')), 'cnt']],
+        raw: true,
+      }),
+      ProductRegisterModel.findAll({
+        where: { status: 'reversed', date: { [Op.between]: [monthStart, todayEnd] } },
+        attributes: [
+          'product_name',
+          [fn('SUM', col('qty')),       'qty'],
+          [fn('SUM', col('total_sum')), 'total'],
+        ],
+        group: ['product_name'],
+        order: [[fn('SUM', col('total_sum')), 'DESC']],
+        limit: 5,
+        raw: true,
+      }),
+    ])
+    const returnsAnalytics = {
+      totalReturnedAmount: Number(returnRows[0]?.total) || 0,
+      returnedCount:       Number(returnRows[0]?.cnt)   || 0,
+      topReturnedProducts: topReturnedRaw.map(r => ({
+        name:  r.product_name,
+        qty:   Number(r.qty)   || 0,
+        total: Number(r.total) || 0,
+      })),
+    }
+
+    // 4) Top kategoriyalar (shu oy) — product_register → product.category
+    const catSalesRaw = await ProductRegisterModel.findAll({
+      where: { status: 'active', date: { [Op.between]: [monthStart, todayEnd] }, product_id: { [Op.not]: null } },
+      attributes: [
+        'product_id',
+        [fn('SUM', col('qty')),       'qty'],
+        [fn('SUM', col('total_sum')), 'revenue'],
+      ],
+      group: ['product_id'],
+      raw: true,
+    })
+    const catProdIds = catSalesRaw.map(r => r.product_id)
+    let catMap = {}
+    if (catProdIds.length) {
+      const prods = await ProductModel.findAll({
+        where: { id: { [Op.in]: catProdIds } },
+        attributes: ['id', 'category'],
+        raw: true,
+      })
+      prods.forEach(p => { catMap[p.id] = p.category })
+    }
+    const catAgg = {}
+    catSalesRaw.forEach(r => {
+      const cat = catMap[r.product_id] || 'Boshqa'
+      if (!catAgg[cat]) catAgg[cat] = { categoryName: cat, salesCount: 0, totalRevenue: 0 }
+      catAgg[cat].salesCount   += Number(r.qty)     || 0
+      catAgg[cat].totalRevenue += Number(r.revenue) || 0
+    })
+    const catTotalRevenue = Object.values(catAgg).reduce((s, c) => s + c.totalRevenue, 0)
+    const topCategories = Object.values(catAgg)
+      .sort((a, b) => b.totalRevenue - a.totalRevenue)
+      .slice(0, 8)
+      .map((c, i) => ({
+        categoryId:      i + 1,
+        categoryName:    c.categoryName,
+        salesCount:      Math.round(c.salesCount),
+        totalRevenue:    c.totalRevenue,
+        sharePercentage: catTotalRevenue > 0 ? +((c.totalRevenue / catTotalRevenue) * 100).toFixed(1) : 0,
+      }))
+
+    // 5) Mijozlar faolligi (shu oy)
+    const [newClients, activeRows] = await Promise.all([
+      ClientModel.count({ where: { active: true, createdAt: { [Op.gte]: monthStart } } }),
+      KassaRegisterModel.findAll({
+        where: {
+          status: 'completed', sale_id: { [Op.not]: null },
+          client_id: { [Op.not]: null },
+          date: { [Op.between]: [monthStart, todayEnd] },
+        },
+        attributes: ['client_id'],
+        group: ['client_id'],
+        raw: true,
+      }),
+    ])
+    const activeClientIds = activeRows.map(r => r.client_id)
+    let returningCount = 0
+    if (activeClientIds.length) {
+      returningCount = await ClientModel.count({
+        where: { id: { [Op.in]: activeClientIds }, createdAt: { [Op.lt]: monthStart } },
+      })
+    }
+    const customerAnalytics = {
+      newCustomersCount:       newClients,
+      returningCustomersCount: returningCount,
+      activeCustomers:         activeClientIds.length,
+    }
+
+    // Top kassirlar (bugun)
+    const cashierRows = await KassaRegisterModel.findAll({
+      where: { status: 'completed', date: { [Op.between]: [todayStart, todayEnd] }, sale_id: { [Op.not]: null } },
+      attributes: [
+        'cashier_id',
+        'cashier_name',
+        [fn('COUNT', col('id')),          'sales_count'],
+        [fn('SUM',   col('total_sum')),   'total_sum'],
+        [fn('SUM',   col('paid_sum')),    'paid_sum'],
+        [fn('SUM',   col('item_count')),  'items'],
+      ],
+      group: ['cashier_id', 'cashier_name'],
+      order: [[fn('SUM', col('total_sum')), 'DESC']],
+      limit: 5,
+      raw: true,
+    })
+
+    res.json({
+      lowStock,
+      expenses,
+      totalExpenses,
+      debtClients,
+      debtSuppliers,
+      topProducts: topProducts.map(r => ({
+        name:    r.product_name,
+        revenue: Number(r.revenue) || 0,
+        qty:     Number(r.qty)     || 0,
+        profit:  (Number(r.revenue) || 0) - (Number(r.cost) || 0),
+      })),
+      payTypes: payRows.map(r => ({
+        type:  r.payment_type,
+        total: Number(r.total) || 0,
+        count: Number(r.count) || 0,
+      })),
+      cashiers: cashierRows.map(r => ({
+        id:          r.cashier_id,
+        name:        r.cashier_name || 'Noma\'lum',
+        sales_count: Number(r.sales_count) || 0,
+        total_sum:   Number(r.total_sum)   || 0,
+        paid_sum:    Number(r.paid_sum)    || 0,
+        items:       Number(r.items)       || 0,
+      })),
+      chart: { labels: chartLabels, revenue: chartRevenue, cost: chartCost, profit: chartProfit, period },
+      averageOrderValue,
+      netProfit,
+      returnsAnalytics,
+      topCategories,
+      customerAnalytics,
+    })
+  }
+
+  // ── Supplier report ───────────────────────────────────────────
+  getSupplierReport = async (req, res) => {
+    const { date_from, date_to } = req.query
+
+    const suppliers = await SupplierModel.findAll({
+      where: { active: true },
+      attributes: ['id', 'name', 'phone', 'code', 'balance'],
+      order: [['name', 'ASC']],
+      raw: true,
+    })
+
+    const result = await Promise.all(suppliers.map(async (s) => {
+      const purchaseWhere = { supplier_id: s.id, status: 'confirmed' }
+      if (date_from || date_to) {
+        purchaseWhere.date = {}
+        Object.assign(purchaseWhere.date, dateRange(Op, date_from, date_to) || {})
+      }
+
+      const payWhere = { reference_type: 'supplier_payment', reference_id: s.id }
+      if (date_from || date_to) {
+        payWhere.date = {}
+        Object.assign(payWhere.date, dateRange(Op, date_from, date_to) || {})
+      }
+
+      const [purchasedSum, purchasedUsd, paidSum] = await Promise.all([
+        PurchaseModel.sum('total_sum', { where: purchaseWhere }) || 0,
+        PurchaseModel.sum('total_usd', { where: purchaseWhere }) || 0,
+        CashTransactionModel.sum('amount', { where: payWhere })  || 0,
+      ])
+
+      const totalSum = Number(purchasedSum) || 0
+      const totalUsd = Number(purchasedUsd) || 0
+      const paid     = Number(paidSum)      || 0
+      const debtSum  = totalSum - paid
+      const exchRate = totalUsd > 0 && totalSum > 0 ? totalSum / totalUsd : 11000
+      const debtUsd  = exchRate > 0 ? debtSum / exchRate : 0
+
+      return {
+        id:          s.id,
+        name:        s.name,
+        phone:       s.phone || '',
+        code:        s.code  || '',
+        balance:     Number(s.balance) || 0,
+        total_sum:   totalSum,
+        total_usd:   +totalUsd.toFixed(2),
+        paid_sum:    paid,
+        debt_sum:    debtSum,
+        debt_usd:    +debtUsd.toFixed(2),
+        exch_rate:   Math.round(exchRate),
+      }
+    }))
+
+    const summary = {
+      total_sum: result.reduce((s, r) => s + r.total_sum, 0),
+      total_usd: +result.reduce((s, r) => s + r.total_usd, 0).toFixed(2),
+      paid_sum:  result.reduce((s, r) => s + r.paid_sum,  0),
+      debt_sum:  result.reduce((s, r) => s + r.debt_sum,  0),
+      debt_usd:  +result.reduce((s, r) => s + r.debt_usd, 0).toFixed(2),
+    }
+
+    res.json({ suppliers: result.filter(r => r.total_sum > 0 || r.balance !== 0), summary, all: result })
+  }
+
+  // ── Cash register detail ──────────────────────────────────────
+  getCashRegister = async (req, res) => {
+    const { date_from, date_to } = req.query
+    const where = {}
+    if (date_from || date_to) where.date = range(date_from, date_to)
+
+    const rows = await KassaRegisterModel.findAll({
+      where,
+      order: [['date', 'DESC']],
+      raw: true,
+    })
+
+    const summary = { completed: 0, cancelled: 0, paid: 0, debt: 0, discount: 0 }
+    rows.filter(r => r.status === 'completed').forEach(r => {
+      summary.completed += Number(r.total_sum) || 0
+      summary.paid      += Number(r.paid_sum)  || 0
+      summary.debt      += Number(r.debt_sum)  || 0
+      summary.discount  += Number(r.discount)  || 0
+    })
+    rows.filter(r => r.status === 'cancelled').forEach(r => {
+      summary.cancelled += Number(r.total_sum) || 0
+    })
+
+    res.json({ rows, summary })
+  }
+}
+
+module.exports = new ReportController()
