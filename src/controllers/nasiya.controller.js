@@ -239,10 +239,11 @@ class NasiyaController {
   }
 
   /**
-   * POST /api/v1/nasiya/pasport { client_id, passport, pinfl }
-   * Nasiya rasmiylashtirilayotganda mijozga pasport yozib qo'yish.
+   * POST /api/v1/nasiya/pasport { client_id, passport, pinfl, phone, address }
+   * Nasiya rasmiylashtirilayotganda mijozga pasport, telefon va manzilni
+   * yozib qo'yish (shartnomada chiqadi).
    * Kassirda mijozlarni tahrirlash huquqi bo'lmasa ham ishlaydi — faqat
-   * shu ikki maydon o'zgaradi.
+   * shu maydonlar o'zgaradi (ism, balans va boshqalar emas).
    */
   pasportSaqla = async (req, res) => {
     const client = await ClientModel.findByPk(req.body.client_id)
@@ -250,6 +251,13 @@ class NasiyaController {
     const body = {}
     if (req.body.passport !== undefined) body.passport = req.body.passport
     if (req.body.pinfl !== undefined) body.pinfl = req.body.pinfl
+    // Shartnomada chiqadigan telefon va manzil — faqat yangi qiymat
+    // berilganda yoziladi (bo'sh yuborilsa eskisi o'chmaydi)
+    const matn = (v, max) => (typeof v === 'string' ? v.trim().slice(0, max) : '')
+    const tel = matn(req.body.phone, 30)
+    const manzil = matn(req.body.address, 300)
+    if (tel) body.phone = tel
+    if (manzil) body.address = manzil
     await pasportTekshir(body, client.id)
     await client.update(body)
     res.json(mijozKorinish(client))
